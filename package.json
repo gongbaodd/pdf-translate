@@ -1,0 +1,16 @@
+{
+  "name": "babeldoc-codex-translation",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "bridge": "node scripts/translation_bridge.ts",
+    "login": "node scripts/translation_bridge.ts login",
+    "test:adapter": "node --test test/translation_bridge.test.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.0.0"
+  }
+}

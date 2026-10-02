@@ -1,0 +1,13 @@
+source,target
+bounded context,限界上下文
+aggregate,聚合
+aggregate root,聚合根
+ubiquitous language,通用语言
+domain-driven design,领域驱动设计
+domain model,领域模型
+entity,实体
+value object,值对象
+repository,仓储
+domain event,领域事件
+application service,应用服务
+invariant,不变量
