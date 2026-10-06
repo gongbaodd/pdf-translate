@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run BabelDOC with either pi-ai Codex OAuth or a direct OpenAI-compatible API."""
+"""Run BabelDOC with pi-ai Codex OAuth, OpenCode Go, or a direct OpenAI-compatible API."""
 
 from __future__ import annotations
 
@@ -23,8 +23,13 @@ DEFAULT_GLOSSARY = ROOT / "glossary" / "ddd-en-zh.csv"
 DEFAULT_AUTH_FILE = Path(
     os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
 ) / "babeldoc-codex" / "auth.json"
+DEFAULT_OPENCODE_GO_AUTH_FILE = Path(
+    os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+) / "babeldoc-opencode-go" / "auth.json"
 BRIDGE_SCRIPT = ROOT / "scripts" / "translation_bridge.ts"
 CODEX_ALIAS_PREFIX = "pi-codex-v1/"
+OPENCODE_GO_ALIAS_PREFIX = "opencode-go/"
+BRIDGE_BACKENDS = frozenset(("codex", "opencode-go"))
 
 
 class TranslationError(RuntimeError):
@@ -34,18 +39,25 @@ class TranslationError(RuntimeError):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", nargs="?", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--backend", choices=("codex", "openai-compatible"), default="codex")
+    parser.add_argument("--backend", choices=("codex", "opencode-go", "openai-compatible"), default="codex")
     parser.add_argument("--pages", help="BabelDOC page selector, for example 31,81,151")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--model", required=True, help="Explicit provider model ID")
     parser.add_argument("--base-url", help="OpenAI-compatible /v1 endpoint for direct mode")
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
     parser.add_argument("--qps", type=int)
-    parser.add_argument("--auth-file", type=Path, default=DEFAULT_AUTH_FILE)
+    parser.add_argument("--auth-file", type=Path)
     parser.add_argument("--babeldoc", default="babeldoc", help="BabelDOC executable")
     parser.add_argument("--debug", action="store_true", help="Preserve BabelDOC tracebacks and debug artifacts")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
+
+def auth_file_for(args: argparse.Namespace) -> Path | None:
+    if args.backend == "codex":
+        return (args.auth_file or DEFAULT_AUTH_FILE).expanduser().resolve()
+    if args.backend == "opencode-go":
+        return (args.auth_file or DEFAULT_OPENCODE_GO_AUTH_FILE).expanduser().resolve()
+    return None
 
 
 def check_executable(executable: str, label: str) -> None:
@@ -172,13 +184,13 @@ def wait_for_bridge(process: subprocess.Popen[str]) -> dict[str, Any]:
     line = process.stdout.readline()
     if not line:
         detail = process.poll()
-        raise TranslationError(f"Codex bridge exited before readiness (status={detail})")
+        raise TranslationError(f"provider bridge exited before readiness (status={detail})")
     try:
         message = json.loads(line)
     except json.JSONDecodeError as error:
-        raise TranslationError(f"Codex bridge emitted invalid readiness JSON: {line!r}") from error
+        raise TranslationError(f"provider bridge emitted invalid readiness JSON: {line!r}") from error
     if not message.get("ready") or not isinstance(message.get("port"), int):
-        raise TranslationError(f"Codex bridge did not become ready: {message!r}")
+        raise TranslationError(f"provider bridge did not become ready: {message!r}")
     return message
 
 
@@ -187,9 +199,9 @@ def check_bridge_health(port: int) -> None:
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             if response.status != 200:
-                raise TranslationError(f"Codex bridge health check returned HTTP {response.status}")
+                raise TranslationError(f"provider bridge health check returned HTTP {response.status}")
     except urllib.error.URLError as error:
-        raise TranslationError(f"Codex bridge health check failed: {error}") from error
+        raise TranslationError(f"provider bridge health check failed: {error}") from error
 
 
 def terminate(process: subprocess.Popen[str] | None) -> None:
@@ -231,21 +243,24 @@ def run_translation(args: argparse.Namespace) -> int:
         raise TranslationError(f"glossary does not exist: {DEFAULT_GLOSSARY}")
     args.output_dir = args.output_dir.expanduser().resolve()
     final_path = args.output_dir / f"{input_path.stem}.en-zh.side-by-side.pdf"
-    qps = args.qps if args.qps is not None else (1 if args.backend == "codex" else 2)
+    bridge_backend = args.backend in BRIDGE_BACKENDS
+    qps = args.qps if args.qps is not None else (1 if bridge_backend else 2)
     if qps < 1:
         raise TranslationError("--qps must be at least 1")
-    if args.backend == "codex" and args.base_url:
+    if bridge_backend and args.base_url:
         raise TranslationError("--base-url is only valid with --backend openai-compatible")
     base_url = args.base_url or "https://api.openai.com/v1"
     key_env = args.api_key_env
     api_key = os.environ.get(key_env, "")
     if args.backend == "openai-compatible" and not args.dry_run and not api_key:
         raise TranslationError(f"missing API key in environment variable {key_env}")
-    if args.backend == "codex":
+    auth_file = auth_file_for(args)
+    if bridge_backend:
         check_node()
         if not BRIDGE_SCRIPT.is_file():
-            raise TranslationError(f"Codex bridge does not exist: {BRIDGE_SCRIPT}")
-        model_for_babeldoc = f"{CODEX_ALIAS_PREFIX}{args.model}"
+            raise TranslationError(f"provider bridge does not exist: {BRIDGE_SCRIPT}")
+        alias_prefix = CODEX_ALIAS_PREFIX if args.backend == "codex" else OPENCODE_GO_ALIAS_PREFIX
+        model_for_babeldoc = f"{alias_prefix}{args.model}"
         base_url = "http://127.0.0.1:<ephemeral-port>/v1"
         api_key = "<per-run-local-bearer-token>"
     else:
@@ -270,7 +285,7 @@ def run_translation(args: argparse.Namespace) -> int:
         "qps": qps,
         "output_dir": str(args.output_dir),
         "output_file": str(final_path),
-        "auth_file": str(args.auth_file.expanduser().resolve()) if args.backend == "codex" else None,
+        "auth_file": str(auth_file) if bridge_backend else None,
         "command": command_preview,
     }
     if args.dry_run:
@@ -286,7 +301,7 @@ def run_translation(args: argparse.Namespace) -> int:
     temporary_directory = tempfile.TemporaryDirectory(prefix="babeldoc-translation-")
     config_path = Path(temporary_directory.name) / "babeldoc.toml"
     try:
-        if args.backend == "codex":
+        if bridge_backend:
             environment = os.environ.copy()
             environment["BABELDOC_BRIDGE_TOKEN"] = token
             bridge = subprocess.Popen(
@@ -295,10 +310,12 @@ def run_translation(args: argparse.Namespace) -> int:
                     str(BRIDGE_SCRIPT),
                     "--port",
                     "0",
+                    "--provider",
+                    args.backend,
                     "--model",
                     args.model,
                     "--auth-file",
-                    str(args.auth_file.expanduser().resolve()),
+                    str(auth_file),
                 ],
                 cwd=ROOT,
                 env=environment,

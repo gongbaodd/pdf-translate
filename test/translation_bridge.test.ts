@@ -31,11 +31,12 @@ test("maps BabelDOC messages and returns a Chat Completions response", async () 
       { role: "system", content: "Translate only; preserve {{1}}." },
       { role: "user", content: "bounded context {{1}}" },
     ],
-  }, new AbortController().signal);
+  }, new AbortController().signal, "bridge-session");
 
   assert.equal(received.context.systemPrompt, "Translate only; preserve {{1}}.");
   assert.equal(received.context.messages[0].content, "bounded context {{1}}");
   assert.equal(received.options.maxTokens, 2048);
+  assert.equal(received.options.sessionId, "bridge-session");
   assert.equal("temperature" in received.options, false);
   assert.equal(result.object, "chat.completion");
   assert.equal(result.choices[0].message.content, "限界上下文");

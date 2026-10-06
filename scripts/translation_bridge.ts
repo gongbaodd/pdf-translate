@@ -9,14 +9,26 @@ import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { createModels } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
+import { opencodeGoProvider } from "@earendil-works/pi-ai/providers/opencode-go";
 
-const PROVIDER_ID = "openai-codex";
-const ALIAS_PREFIX = "pi-codex-v1/";
-const DEFAULT_AUTH_FILE = resolve(
-  process.env.XDG_CONFIG_HOME || `${process.env.HOME || process.cwd()}/.config`,
-  "babeldoc-codex",
-  "auth.json",
-);
+const PROVIDERS = {
+  codex: {
+    id: "openai-codex",
+    name: "Codex",
+    aliasPrefix: "pi-codex-v1/",
+    loginType: "oauth",
+    defaultAuthFile: "babeldoc-codex",
+    create: openaiCodexProvider,
+  },
+  "opencode-go": {
+    id: "opencode-go",
+    name: "OpenCode Go",
+    aliasPrefix: "opencode-go/",
+    loginType: "api_key",
+    defaultAuthFile: "babeldoc-opencode-go",
+    create: opencodeGoProvider,
+  },
+};
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const LOCK_TIMEOUT_MS = 30_000;
 const STALE_LOCK_MS = 5 * 60_000;
@@ -51,8 +63,23 @@ function fail(message, exitCode = 1) {
   process.exitCode = exitCode;
 }
 
+function providerFrom(args) {
+  const name = String(args.provider || "codex");
+  const provider = PROVIDERS[name];
+  if (!provider) {
+    throw new Error(`unknown provider ${name}; choose one of: ${Object.keys(PROVIDERS).join(", ")}`);
+  }
+  return provider;
+}
+
 function authFileFrom(args) {
-  return resolve(String(args["auth-file"] || DEFAULT_AUTH_FILE));
+  const provider = providerFrom(args);
+  const defaultFile = resolve(
+    process.env.XDG_CONFIG_HOME || `${process.env.HOME || process.cwd()}/.config`,
+    provider.defaultAuthFile,
+    "auth.json",
+  );
+  return resolve(String(args["auth-file"] || defaultFile));
 }
 
 async function ensurePrivatePath(file) {
@@ -235,13 +262,13 @@ function errorStatus(error) {
   return 502;
 }
 
-async function completeRequest(models, model, body, signal) {
+async function completeRequest(models, model, body, signal, sessionId) {
   if (body.stream === true) throw new Error("streaming is not supported by the BabelDOC bridge");
   if (body.tools || body.tool_choice || body.response_format) {
     throw new Error("tools, tool_choice, and response_format are not supported");
   }
   if (body.temperature !== undefined && body.temperature !== 0) {
-    throw new Error("Codex bridge only accepts BabelDOC's temperature=0 request");
+    throw new Error("bridge only accepts BabelDOC's temperature=0 request");
   }
   if (body.max_tokens !== undefined && (!Number.isInteger(body.max_tokens) || body.max_tokens < 1)) {
     throw new Error("max_tokens must be a positive integer");
@@ -256,42 +283,56 @@ async function completeRequest(models, model, body, signal) {
     maxRetries: 0,
     transport: "sse",
     signal,
+    ...(sessionId ? { sessionId } : {}),
     ...(body.max_tokens === undefined ? {} : { maxTokens: body.max_tokens }),
   };
   const response = await models.complete(model, context, options);
   if (!["stop", "length"].includes(response.stopReason)) {
-    throw new Error(response.errorMessage || `Codex completion ended with ${response.stopReason}`);
+    throw new Error(response.errorMessage || `completion ended with ${response.stopReason}`);
   }
   if (response.stopReason === "length") {
-    throw new Error("Codex completion was truncated by the output limit");
+    throw new Error("completion was truncated by the output limit");
   }
   const text = response.content
     .filter((part) => part.type === "text")
     .map((part) => part.text)
     .join("")
     .trim();
-  if (!text) throw new Error("Codex returned empty translated text");
+  if (!text) throw new Error("provider returned empty translated text");
   return responseFrom(body.model, response, text);
 }
 
 async function createRuntime(args) {
+  const providerName = String(args.provider || "codex");
+  const provider = providerFrom(args);
   const modelId = String(args.model || "");
   if (!modelId) throw new Error("--model is required");
   const authFile = authFileFrom(args);
   const credentials = createCredentialStore(authFile);
   const models = createModels({ credentials });
-  models.setProvider(openaiCodexProvider());
-  const model = models.getModel(PROVIDER_ID, modelId);
+  models.setProvider(provider.create());
+  const model = models.getModel(provider.id, modelId);
   if (!model) {
-    const available = models.getModels(PROVIDER_ID).map((entry) => entry.id).join(", ");
-    throw new Error(`unknown Codex model ${modelId}; available pinned models: ${available || "none"}`);
+    const available = models.getModels(provider.id).map((entry) => entry.id).join(", ");
+    throw new Error(`unknown ${provider.name} model ${modelId}; available pinned models: ${available || "none"}`);
   }
   const auth = await models.getAuth(model);
   if (!auth) {
-    throw new Error(`no Codex OAuth credential found; run: npm run login -- --auth-file ${authFile}`);
+    throw new Error(
+      `no ${provider.name} credential found; run: npm run login -- --provider ${providerName} --auth-file ${authFile}`,
+    );
   }
-  return { models, model, modelId, authFile };
+  return {
+    models,
+    model,
+    modelId,
+    authFile,
+    provider,
+    providerName,
+    sessionId: randomUUID(),
+  };
 }
+
 
 async function readJson(request) {
   let size = 0;
@@ -312,7 +353,7 @@ async function runServer(args) {
   const token = process.env.BABELDOC_BRIDGE_TOKEN;
   if (!token || token.length < 32) throw new Error("BABELDOC_BRIDGE_TOKEN must be a random local bearer token");
   const runtime = await createRuntime(args);
-  const expectedAliases = new Set([runtime.modelId, `${ALIAS_PREFIX}${runtime.modelId}`]);
+  const expectedAliases = new Set([runtime.modelId, `${runtime.provider.aliasPrefix}${runtime.modelId}`]);
   let active = 0;
   const queued = [];
   const server = createServer(async (request, response) => {
@@ -322,7 +363,7 @@ async function runServer(args) {
       response.end(JSON.stringify(body));
     };
     if (request.method === "GET" && pathname === "/healthz") {
-      write(200, { status: "ok", provider: PROVIDER_ID, model: runtime.modelId, active });
+      write(200, { status: "ok", provider: runtime.provider.id, model: runtime.modelId, active });
       return;
     }
     if (request.method !== "POST" || pathname !== "/v1/chat/completions") {
@@ -347,7 +388,7 @@ async function runServer(args) {
     try {
       const body = await readJson(request);
       if (!body || !expectedAliases.has(body.model)) throw new Error(`unsupported model alias: ${String(body?.model)}`);
-      const result = await completeRequest(runtime.models, runtime.model, body, controller.signal);
+      const result = await completeRequest(runtime.models, runtime.model, body, controller.signal, runtime.sessionId);
       write(200, result);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -376,22 +417,61 @@ async function runServer(args) {
   await running.promise;
 }
 
+async function promptSecret(rl, message) {
+  const prompt = `${message}: `;
+  if (!input.isTTY || typeof input.setRawMode !== "function") {
+    return rl.question(prompt);
+  }
+  rl.pause();
+  output.write(prompt);
+  input.setRawMode(true);
+  input.resume();
+  const { promise, resolve: resolvePrompt, reject: rejectPrompt } = Promise.withResolvers();
+  let value = "";
+  const onData = (chunk) => {
+    const key = String(chunk);
+    if (key === "\u0003") {
+      cleanup();
+      rejectPrompt(new Error("login cancelled"));
+    } else if (key === "\r" || key === "\n") {
+      cleanup();
+      output.write("\n");
+      resolvePrompt(value);
+    } else if (key === "\u007f" || key === "\b") {
+      if (value) value = value.slice(0, -1);
+    } else {
+      value += key;
+    }
+  };
+  const cleanup = () => {
+    input.setRawMode(false);
+    input.removeListener("data", onData);
+    rl.resume();
+  };
+  input.on("data", onData);
+  return promise;
+}
+
 async function runLogin(args) {
+  const provider = providerFrom(args);
   const authFile = authFileFrom(args);
   const credentials = createCredentialStore(authFile);
   const models = createModels({ credentials });
-  models.setProvider(openaiCodexProvider());
+  models.setProvider(provider.create());
   const rl = createInterface({ input, output });
   try {
-    const credential = await models.login(PROVIDER_ID, "oauth", {
+    const credential = await models.login(provider.id, provider.loginType, {
       prompt: async (prompt) => {
         if (prompt.type === "select") {
           console.log(prompt.message);
           prompt.options.forEach((option, index) => console.log(`  ${index + 1}. ${option.label}`));
           const answer = await rl.question(`Choose 1-${prompt.options.length}: `);
           const selected = prompt.options[Number.parseInt(answer, 10) - 1];
-          if (!selected) throw new Error("invalid OAuth selection");
+          if (!selected) throw new Error("invalid login selection");
           return selected.id;
+        }
+        if (prompt.type === "secret") {
+          return promptSecret(rl, prompt.message);
         }
         return rl.question(`${prompt.message}${prompt.placeholder ? ` (${prompt.placeholder})` : ""}: `);
       },
@@ -406,7 +486,7 @@ async function runLogin(args) {
         }
       },
     }, { getDeviceId: randomUUID });
-    console.log(`Credentials saved to ${authFile}`);
+    console.log(`${provider.name} credentials saved to ${authFile}`);
     return credential;
   } finally {
     rl.close();

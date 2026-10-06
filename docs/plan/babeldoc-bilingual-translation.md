@@ -3,11 +3,11 @@
 ## Goal
 
 Write a Python wrapper around BabelDOC's CLI, with a local TypeScript bridge
-using pi-ai, to translate `learningdomain-drivendesign.pdf` with Codex into a
-bilingual PDF with English on the left and Simplified Chinese on the right.
-Each original page and its translation should share one wide output page.
-Retain direct OpenAI-compatible API access as an explicitly selected alternative.
-
+using pi-ai, to translate `learningdomain-drivendesign.pdf` with either Codex
+OAuth or an OpenCode Go API key into a bilingual PDF with English on the left
+and Simplified Chinese on the right. Each original page and its translation
+should share one wide output page. Retain direct OpenAI-compatible API access
+as an explicitly selected alternative.
 BabelDOC supports this layout directly. Keep its CLI as the integration boundary
 instead of coupling the wrapper to its internal Python APIs. The CLI is documented
 as primarily for debugging and has no end-user technical support; pin its version
@@ -17,8 +17,8 @@ and verify compatibility with a sample before translating the book.
 
 Use the provider/auth/model separation in
 [pi's AI package](https://github.com/earendil-works/pi/tree/main/packages/ai).
-Reuse `@earendil-works/pi-ai` rather than reimplementing Codex OAuth, token refresh,
-account headers, or the Responses transport in Python.
+Reuse `@earendil-works/pi-ai` rather than reimplementing provider
+authentication, account headers, or the provider transports in Python.
 
 ```text
 scripts/translate_pdf.py
@@ -26,29 +26,31 @@ scripts/translate_pdf.py
      -> local /v1/chat/completions bridge
         -> pi-ai Models collection
            -> OpenAI Codex provider (OAuth / ChatGPT subscription)
+           -> OpenCode Go provider (API key / Go subscription)
 ```
 
-- BabelDOC's OpenAI translator calls Chat Completions. pi-ai's `openai-codex`
-  provider uses `openai-codex-responses`, not that wire protocol. Setting
-  `--openai-base-url` to the Codex backend alone will not work.
+- BabelDOC's OpenAI translator calls Chat Completions. pi-ai's subscription
+  providers use provider-specific transports, so setting BabelDOC's base URL to
+  an upstream provider alone will not work.
 - Default wrapper backend: `codex`, using `openaiCodexProvider()` and an
-  explicitly selected model from that provider's catalog. No separate
-  `OPENAI_API_KEY` is required for this subscription-backed route.
+  explicitly selected model from that provider's catalog. `opencode-go` is an
+  equivalent bridge backend using `opencodeGoProvider()` and its catalog.
+- Neither subscription backend requires `OPENAI_API_KEY`; OpenCode Go requires
+  an API key obtained from the OpenCode Console.
 - Alternative wrapper backend: `openai-compatible`, using BabelDOC directly
-  with the configured endpoint, model, and API key; no bridge or Codex login.
-  Never silently switch from subscription authentication to paid API billing.
-- Upstream currently labels `openai-codex` **legacy**, superseded by “Sign in
-  with ChatGPT” on its `openai` provider. Pin a release/commit that includes the
-  selected Codex provider and model. Any later provider migration must explicitly
-  revalidate OAuth, model availability, and transport; do not assume all releases
-  expose the same API.
+  with the configured endpoint, model, and API key; no bridge or subscription
+  login. Never silently switch from subscription authentication to paid API
+  billing.
+- Pin a release/commit that includes both selected providers and model catalogs.
+  Any later provider migration must explicitly revalidate authentication,
+  model availability, session headers, and transport.
 
 Design references:
-
 - [pi-ai providers, Models, and authentication](https://github.com/earendil-works/pi/blob/main/packages/ai/README.md)
-- [Codex provider implementation](https://github.com/earendil-works/pi/blob/main/packages/ai/src/providers/openai-codex.ts)
+- [OpenCode Go provider documentation](https://opencode.ai/docs/go/)
 - [BabelDOC CLI configuration](https://funstory-ai.github.io/BabelDOC/#advanced-options)
 - [BabelDOC Chat Completions translator](https://github.com/funstory-ai/BabelDOC/blob/main/babeldoc/translator/translator.py)
+
 
 ## Source inspection
 
@@ -72,16 +74,18 @@ Design references:
 ### 2. Write `scripts/translate_pdf.py`
 
 - Default to this book while accepting another input path.
-- Support `--backend codex|openai-compatible` (default `codex`), `--pages`,
-  `--output-dir`, `--model`, `--base-url`, `--qps`, `--auth-file`, and `--dry-run`.
-  Require an explicit model; validate Codex models against the pinned catalog.
-- Treat `--base-url` as a direct API-backend option only. In Codex mode, the
-  wrapper allocates a loopback port and configures BabelDOC to use the bridge's
+- Support `--backend codex|opencode-go|openai-compatible` (default `codex`),
+  `--pages`, `--output-dir`, `--model`, `--base-url`, `--qps`, `--auth-file`,
+  and `--dry-run`. Require an explicit model and validate it against the
+  selected pinned provider catalog.
+- Treat `--base-url` as a direct API-backend option only. In either bridge
+  backend, allocate a loopback port and configure BabelDOC to use the bridge's
   `/v1` base URL, `--openai`, and a provider-qualified model alias.
-- In direct API mode, read the API key from an environment variable. In Codex
-  mode, only the bridge reads the OAuth credential store. Keep all credentials
-  out of logs, command-line arguments, and committed files; use a restricted
-  temporary BabelDOC config when a credential cannot be supplied via environment.
+- In direct API mode, read the API key from an environment variable. In bridge
+  modes, only the bridge reads the provider credential store. Keep all
+  credentials out of logs, command-line arguments, and committed files; use a
+  restricted temporary BabelDOC config when a credential cannot be supplied via
+  environment.
 - Start one bridge per translation run, wait for readiness before starting
   BabelDOC, and stop both children on completion, failure, or interruption.
 - Validate dependencies, input, model, and the selected authentication route
@@ -94,23 +98,25 @@ Design references:
 
 #### Provider and authentication
 
-- Register `openaiCodexProvider()` in `createModels({ credentials })`; select the
-  model with `models.getModel("openai-codex", modelId)`. Use the public Models
-  login and completion methods, not private OAuth implementation imports.
-- Implement a login command around `models.login("openai-codex", "oauth", ...)`,
-  handling the provider's URL/code prompts and cancellation. Let pi-ai own the
-  OAuth flow and provider-specific request authentication.
+- Register both `openaiCodexProvider()` and `opencodeGoProvider()` in
+  `createModels({ credentials })`; select the model with the matching provider
+  ID. Use the public Models login and completion methods, not private auth
+  implementation imports.
+- Implement provider-selected login around
+  `models.login("openai-codex", "oauth", ...)` for Codex and
+  `models.login("opencode-go", "api_key", ...)` for OpenCode Go. Let pi-ai own
+  OAuth, API-key prompting, and provider-specific request authentication.
 - Inject a persistent `CredentialStore` outside the repository, selected by
   `--auth-file`; restrict the directory/file to the current user. Implement its
   serialized `modify` contract with process-safe locking and atomic writes so
   concurrent requests/runs cannot race refresh-token rotation.
-- Let Models refresh expiring credentials and persist the refreshed values.
-  Missing/revoked credentials must produce an actionable re-login error, not
-  an empty translation or API-key fallback. Do not assume pi-ai automatically
-  reads Codex CLI or pi coding-agent credential files.
+- Let Models refresh expiring Codex credentials and persist the refreshed values.
+  Missing/revoked credentials must produce an actionable re-login error, not an
+  empty translation or API-key fallback. OpenCode Go uses its stored API key
+  without OAuth refresh.
 - Bind only to `127.0.0.1`, require a per-run random bridge bearer token, and pass
-  only that local token to BabelDOC. Never expose OAuth tokens to BabelDOC or
-  forward the local bearer token upstream.
+  only that local token to BabelDOC. Never expose provider credentials to
+  BabelDOC or forward the local bearer token upstream.
 
 #### BabelDOC compatibility boundary
 
@@ -135,14 +141,16 @@ Design references:
   rate-limit, transport, cancellation, empty output, and truncated responses
   must not become successful partial/empty translations. Return actionable
   OpenAI-shaped HTTP errors, preserving rate-limit semantics.
-- Bound in-flight Codex requests to one initially, with BabelDOC QPS 1 and
-  `--pool-max-workers 1 --term-pool-max-workers 1`. Measure the sample before
-  increasing concurrency; QPS alone does not bound long-running requests.
+- Bound in-flight subscription-backend requests to one initially, with BabelDOC
+  QPS 1 and `--pool-max-workers 1 --term-pool-max-workers 1`. Measure the
+  sample before increasing concurrency; QPS alone does not bound long-running
+  requests.
   Account for retries already performed by BabelDOC and pi-ai rather than
   adding another independent retry loop.
 - Preserve BabelDOC caching. Use a stable provider/model-qualified alias,
-  resolved by the bridge, to separate Codex from direct-API cache entries.
-  Version that alias when translation-affecting bridge settings change; never
+  resolved by the bridge, to separate each subscription backend from direct-API
+  cache entries. Send a stable `x-opencode-session` value for OpenCode Go.
+  Version the alias when translation-affecting bridge settings change; never
   include credentials or the ephemeral port in the cache identity.
 
 ### 4. Configure bilingual output
@@ -152,8 +160,8 @@ Design references:
   `--use-alternating-pages-dual` or `--dual-translate-first`.
 - Use `--watermark-output-mode no_watermark`.
 - Process in 25-page parts using `--max-pages-per-part 25`, with automatic
-  merging. Start Codex at QPS 1 and one worker as above; direct API mode may
-  retain the original conservative QPS of 2.
+  merging. Start either subscription backend at QPS 1 and one worker as above;
+  direct API mode may retain the original conservative QPS of 2.
 
 Configuration reference: https://funstory-ai.github.io/BabelDOC/#advanced-options
 

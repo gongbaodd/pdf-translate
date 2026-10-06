@@ -8,6 +8,7 @@
   "scripts": {
     "bridge": "node scripts/translation_bridge.ts",
     "login": "node scripts/translation_bridge.ts login",
+    "login:opencode-go": "node scripts/translation_bridge.ts login --provider opencode-go",
     "test:adapter": "node --test test/translation_bridge.test.ts"
   },
   "dependencies": {

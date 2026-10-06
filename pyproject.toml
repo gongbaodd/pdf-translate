@@ -1,7 +1,7 @@
 [project]
 name = "babeldoc-codex-translation"
 version = "0.1.0"
-description = "BabelDOC bilingual PDF translation with a pi-ai Codex bridge"
+description = "BabelDOC bilingual PDF translation with pi-ai subscription bridges"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "BabelDOC==0.6.4",

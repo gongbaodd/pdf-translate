@@ -21,3 +21,4 @@ output/
 .translation-auth.json
 .translation-auth.json.lock
 pdf/
+pi-cast/
