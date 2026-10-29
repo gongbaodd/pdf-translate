@@ -1,0 +1,242 @@
+import argparse
+import importlib.util
+import io
+import json
+import shutil
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+MODULE_PATH = ROOT / "scripts" / "translate_pdf.py"
+SPEC = importlib.util.spec_from_file_location("translate_pdf", MODULE_PATH)
+assert SPEC and SPEC.loader
+translate_pdf = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(translate_pdf)
+
+
+def config_args(*, debug: bool = False, pages: str | None = None) -> argparse.Namespace:
+    return argparse.Namespace(debug=debug, pages=pages)
+
+
+def build_config(output_mode: str, output_dir: Path) -> str:
+    return translate_pdf.build_config(
+        config_args(),
+        api_key="local-token",
+        base_url="http://127.0.0.1:1234/v1",
+        output_dir=output_dir,
+        model="test/model",
+        qps=1,
+        output_mode=output_mode,
+    )
+
+
+def touch_pdf(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"%PDF-1.4\n")
+    return path
+
+
+class ConfigTests(unittest.TestCase):
+    def test_bilingual_config_disables_mono(self) -> None:
+        config = build_config("bilingual", Path("/tmp/output"))
+        self.assertIn('lang-out = "zh"', config)
+        self.assertIn("no-mono = true", config)
+        self.assertNotIn("no-dual", config)
+
+    def test_translated_only_config_disables_dual(self) -> None:
+        config = build_config("translated-only", Path("/tmp/output"))
+        self.assertIn('lang-out = "zh"', config)
+        self.assertIn("no-dual = true", config)
+        self.assertNotIn("no-mono", config)
+
+    def test_bilingual_config_keeps_part_splitting_without_pages(self) -> None:
+        self.assertIn("max-pages-per-part = 25", build_config("bilingual", Path("/tmp")))
+        page_limited = translate_pdf.build_config(
+            config_args(pages="1,2"),
+            api_key="local-token",
+            base_url="http://127.0.0.1:1234/v1",
+            output_dir=Path("/tmp"),
+            model="test/model",
+            qps=1,
+            output_mode="translated-only",
+        )
+        self.assertNotIn("max-pages-per-part", page_limited)
+
+
+class FinalPathTests(unittest.TestCase):
+    def test_bilingual_final_path_is_unchanged(self) -> None:
+        path = translate_pdf.final_output_path(
+            Path("/tmp/book.pdf"), Path("/tmp/out"), "bilingual"
+        )
+        self.assertEqual(path, Path("/tmp/out/book.en-zh.side-by-side.pdf"))
+
+    def test_translated_only_final_path(self) -> None:
+        path = translate_pdf.final_output_path(
+            Path("/tmp/book.pdf"), Path("/tmp/out"), "translated-only"
+        )
+        self.assertEqual(path, Path("/tmp/out/book.zh.mono.pdf"))
+
+
+class FindOutputTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.output_dir = Path(self.tempdir.name)
+        self.final = self.output_dir / "final.pdf"
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_prefers_merged_mono_over_no_watermark_variant(self) -> None:
+        primary = touch_pdf(self.output_dir / "book.zh.mono.pdf")
+        touch_pdf(self.output_dir / "book.no_watermark.zh.mono.pdf")
+        found = translate_pdf.find_output(
+            self.output_dir, set(), self.final, "translated-only"
+        )
+        self.assertEqual(found, primary)
+
+    def test_accepts_single_no_watermark_mono(self) -> None:
+        expected = touch_pdf(self.output_dir / "book.no_watermark.zh.mono.pdf")
+        found = translate_pdf.find_output(
+            self.output_dir, set(), self.final, "translated-only"
+        )
+        self.assertEqual(found, expected)
+
+    def test_bilingual_ignores_mono_output(self) -> None:
+        expected = touch_pdf(self.output_dir / "book.zh.dual.pdf")
+        touch_pdf(self.output_dir / "book.zh.mono.pdf")
+        found = translate_pdf.find_output(
+            self.output_dir, set(), self.final, "bilingual"
+        )
+        self.assertEqual(found, expected)
+
+    def test_ignores_decompressed_debug_artifacts(self) -> None:
+        touch_pdf(self.output_dir / "book.no_watermark.zh.mono.pdf.decompressed.pdf")
+        with self.assertRaises(translate_pdf.TranslationError):
+            translate_pdf.find_output(
+                self.output_dir, set(), self.final, "translated-only"
+            )
+
+    def test_rejects_ambiguous_mono_candidates(self) -> None:
+        touch_pdf(self.output_dir / "a.zh.mono.pdf")
+        touch_pdf(self.output_dir / "b.zh.mono.pdf")
+        with self.assertRaises(translate_pdf.TranslationError):
+            translate_pdf.find_output(
+                self.output_dir, set(), self.final, "translated-only"
+            )
+
+    def test_existing_files_are_ignored(self) -> None:
+        stale = touch_pdf(self.output_dir / "stale.zh.mono.pdf")
+        new = touch_pdf(self.output_dir / "book.zh.mono.pdf")
+        found = translate_pdf.find_output(
+            self.output_dir, {stale}, self.final, "translated-only"
+        )
+        self.assertEqual(found, new)
+
+
+class ValidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        try:
+            import pymupdf
+        except ImportError:  # pragma: no cover
+            self.skipTest("PyMuPDF is unavailable")
+        self.pymupdf = pymupdf
+
+    def write_pdf(self, width: float, height: float) -> Path:
+        handle = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        handle.close()
+        path = Path(handle.name)
+        document = self.pymupdf.open()
+        page = document.new_page(width=width, height=height)
+        page.insert_text((20, 40), "sample text")
+        document.save(path)
+        document.close()
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return path
+
+    def test_translated_only_keeps_source_geometry(self) -> None:
+        path = self.write_pdf(504, 661.5)
+        translate_pdf.validate_output(
+            path,
+            1,
+            [1],
+            output_mode="translated-only",
+            source_size=(504, 661.5),
+        )
+
+    def test_translated_only_rejects_side_by_side_width(self) -> None:
+        path = self.write_pdf(1008, 661.5)
+        with self.assertRaises(translate_pdf.TranslationError):
+            translate_pdf.validate_output(
+                path,
+                1,
+                [1],
+                output_mode="translated-only",
+                source_size=(504, 661.5),
+            )
+
+    def test_bilingual_requires_double_width(self) -> None:
+        path = self.write_pdf(1008, 661.5)
+        translate_pdf.validate_output(
+            path,
+            1,
+            [1],
+            output_mode="bilingual",
+            source_size=(504, 661.5),
+        )
+
+    def test_bilingual_rejects_mono_width(self) -> None:
+        path = self.write_pdf(504, 661.5)
+        with self.assertRaises(translate_pdf.TranslationError):
+            translate_pdf.validate_output(
+                path,
+                1,
+                [1],
+                output_mode="bilingual",
+                source_size=(504, 661.5),
+            )
+
+
+class DryRunTests(unittest.TestCase):
+    def test_translated_only_dry_run_reports_target_without_credentials(self) -> None:
+        babeldoc = ROOT / ".venv" / "bin" / "babeldoc"
+        if not babeldoc.is_file() or shutil.which("node") is None:
+            self.skipTest("local BabelDOC or Node.js is unavailable")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            input_pdf = touch_pdf(Path(tempdir) / "input.pdf")
+            args = argparse.Namespace(
+                input=input_pdf,
+                backend="codex",
+                pages="1",
+                output_dir=Path(tempdir) / "out",
+                model="test-model",
+                base_url=None,
+                api_key_env="OPENAI_API_KEY",
+                qps=None,
+                auth_file=None,
+                babeldoc=str(babeldoc),
+                debug=False,
+                dry_run=True,
+                output_mode="translated-only",
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                status = translate_pdf.run_translation(args)
+
+        self.assertEqual(status, 0)
+        configuration = json.loads(stdout.getvalue())
+        self.assertEqual(configuration["output_mode"], "translated-only")
+        self.assertTrue(configuration["babeldoc_no_dual"])
+        self.assertFalse(configuration["babeldoc_no_mono"])
+        self.assertTrue(
+            configuration["output_file"].endswith("input.zh.mono.pdf")
+        )
+        serialized = json.dumps(configuration)
+        self.assertNotIn("BABELDOC_BRIDGE_TOKEN", serialized)
+        self.assertNotIn("api-key", serialized)
+
+
+if __name__ == "__main__":
+    unittest.main()

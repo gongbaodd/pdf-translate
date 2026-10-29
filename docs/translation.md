@@ -22,9 +22,39 @@ BabelDOC assets and layout models are downloaded once:
 uv run babeldoc --warmup
 ```
 
-The checked-in input is `learningdomain-drivendesign.pdf`. The wrapper defaults
-to that file and writes the final bilingual PDF to
+## Output modes
+
+The checked-in input is `learningdomain-drivendesign.pdf`. With the default
+`--output-mode bilingual`, the wrapper defaults to that file and writes the final
+bilingual PDF to
 `output/pdf/learningdomain-drivendesign.en-zh.side-by-side.pdf`.
+
+Use `--output-mode translated-only` for a monolingual Simplified Chinese PDF.
+The wrapper normalizes BabelDOC's monolingual output to
+`<stem>.zh.mono.pdf`, for example:
+
+```bash
+uv run python scripts/translate_pdf.py \
+  'pdf/learningdomain-drivendesign.pdf' \
+  --model gpt-6-luna \
+  --output-mode translated-only \
+  --output-dir output/zh-only
+```
+
+This writes:
+
+```text
+output/zh-only/learningdomain-drivendesign.zh.mono.pdf
+```
+
+The translated-only PDF keeps the source page size and replaces page text with
+Chinese; it is not a side-by-side spread.
+
+Page selection with `--pages` controls which pages are translated, not which
+pages are emitted. A page-limited run of a 342-page book still produces 342
+output pages, and unselected pages remain in their original language.
+
+## Custom input
 
 Pass another PDF as the positional input argument. The output filename uses
 that PDF's stem:
@@ -163,10 +193,23 @@ After inspecting the sample PDF, omit `--pages`:
 uv run python scripts/translate_pdf.py --model gpt-5.6-luna
 ```
 
-The wrapper uses English-to-Simplified-Chinese side-by-side mode, the checked-in
-DDD glossary, 25-page parts, no watermark, no monolingual output, and one
-worker for the selected bridge backend. BabelDOC's translation cache remains
-enabled.
+The default `bilingual` mode uses English-to-Simplified-Chinese side-by-side
+layout, the checked-in DDD glossary, 25-page parts, no watermark, no monolingual
+output, and one worker for the selected bridge backend. BabelDOC's translation
+cache remains enabled.
+
+For a Chinese-only full run:
+
+```bash
+uv run python scripts/translate_pdf.py \
+  'pdf/learningdomain-drivendesign.pdf' \
+  --model gpt-5.6-luna \
+  --output-mode translated-only \
+  --output-dir output/pdf
+```
+
+This writes `output/pdf/learningdomain-drivendesign.zh.mono.pdf`. The same
+glossary, caching, part splitting, and concurrency limits apply.
 
 ## Security and operational notes
 

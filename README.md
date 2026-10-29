@@ -2,7 +2,7 @@
 
 BabelDOC-based bilingual PDF translation tooling with a local TypeScript bridge backed by [`@earendil-works/pi-ai`](https://github.com/earendil-works/pi/tree/main/packages/ai).
 
-The root project translates English PDFs into English/Simplified-Chinese side-by-side PDFs. The bridge supports:
+The root project translates English PDFs into English/Simplified-Chinese side-by-side PDFs or Chinese-only monolingual PDFs. The bridge supports:
 
 - Codex OAuth through `openai-codex`
 - OpenCode Go API keys through `opencode-go`
@@ -117,6 +117,20 @@ uv run python scripts/translate_pdf.py \
   --model gpt-4o-mini \
   --base-url https://api.openai.com/v1
 ```
+
+Emit a Chinese-only monolingual PDF instead of the side-by-side PDF:
+
+```bash
+uv run python scripts/translate_pdf.py \
+  'pdf/learningdomain-drivendesign.pdf' \
+  --backend opencode-go \
+  --model gpt-5.6-luna \
+  --output-mode translated-only \
+  --output-dir output/zh-only
+```
+
+This writes `output/zh-only/learningdomain-drivendesign.zh.mono.pdf` at the
+source page size. The default remains `--output-mode bilingual`.
 
 Detailed options and operational notes are in [`docs/translation.md`](docs/translation.md).
 

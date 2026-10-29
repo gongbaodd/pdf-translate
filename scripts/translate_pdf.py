@@ -30,6 +30,7 @@ BRIDGE_SCRIPT = ROOT / "scripts" / "translation_bridge.ts"
 CODEX_ALIAS_PREFIX = "pi-codex-v1/"
 OPENCODE_GO_ALIAS_PREFIX = "opencode-go/"
 BRIDGE_BACKENDS = frozenset(("codex", "opencode-go"))
+OUTPUT_MODES = ("bilingual", "translated-only")
 
 
 class TranslationError(RuntimeError):
@@ -41,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", nargs="?", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--backend", choices=("codex", "opencode-go", "openai-compatible"), default="codex")
     parser.add_argument("--pages", help="BabelDOC page selector, for example 31,81,151")
+    parser.add_argument(
+        "--output-mode",
+        choices=OUTPUT_MODES,
+        default="bilingual",
+        help="bilingual: side-by-side PDF; translated-only: Chinese monolingual PDF",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--model", required=True, help="Explicit provider model ID")
     parser.add_argument("--base-url", help="OpenAI-compatible /v1 endpoint for direct mode")
@@ -98,19 +105,21 @@ def build_config(
     output_dir: Path,
     model: str,
     qps: int,
+    output_mode: str = "bilingual",
 ) -> str:
     glossary = DEFAULT_GLOSSARY.resolve()
     lines = [
         "[babeldoc]",
         *(["debug = true"] if args.debug else []),
         'lang-in = "en"',
+        'lang-out = "zh"',
         f"qps = {qps}",
         f"output = {toml_string(str(output_dir))}",
         "openai = true",
         f"openai-model = {toml_string(model)}",
         f"openai-base-url = {toml_string(base_url)}",
         f"openai-api-key = {toml_string(api_key)}",
-        "no-mono = true",
+        *(["no-dual = true"] if output_mode == "translated-only" else ["no-mono = true"]),
         'watermark-output-mode = "no_watermark"',
         *(["max-pages-per-part = 25"] if not args.pages else []),
         "pool-max-workers = 1",
@@ -134,6 +143,12 @@ def parse_explicit_pages(selector: str | None) -> list[int] | None:
     return sorted(set(pages))
 
 
+def final_output_path(input_path: Path, output_dir: Path, output_mode: str) -> Path:
+    if output_mode == "translated-only":
+        return output_dir / f"{input_path.stem}.zh.mono.pdf"
+    return output_dir / f"{input_path.stem}.en-zh.side-by-side.pdf"
+
+
 def page_count_from_pdf(path: Path) -> int | None:
     try:
         import fitz  # type: ignore[import-not-found]
@@ -143,10 +158,25 @@ def page_count_from_pdf(path: Path) -> int | None:
         return document.page_count
 
 
+def page_size_from_pdf(path: Path) -> tuple[float, float] | None:
+    try:
+        import fitz  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    with fitz.open(path) as document:
+        if not document.page_count:
+            return None
+        rect = document[0].rect
+        return rect.width, rect.height
+
+
 def validate_output(
     path: Path,
     expected_pages: int | None,
     translation_pages: list[int] | None = None,
+    *,
+    output_mode: str = "bilingual",
+    source_size: tuple[float, float] | None = None,
 ) -> None:
     if not path.is_file() or path.stat().st_size == 0:
         raise TranslationError(f"BabelDOC did not produce a non-empty output PDF: {path}")
@@ -158,13 +188,21 @@ def validate_output(
     with fitz.open(path) as document:
         if expected_pages is not None and document.page_count != expected_pages:
             raise TranslationError(
-                f"expected {expected_pages} paired output pages, found {document.page_count}"
+                f"expected {expected_pages} output pages, found {document.page_count}"
             )
-        if document.page_count:
+        if document.page_count and source_size is not None:
             width, height = document[0].rect.width, document[0].rect.height
-            if abs(width - 1008) > 12 or abs(height - 662) > 12:
+            source_width, source_height = source_size
+            width_multiplier = 2 if output_mode == "bilingual" else 1
+            expected_width = source_width * width_multiplier
+            expected_height = source_height
+            if (
+                abs(width - expected_width) > 12
+                or abs(height - expected_height) > 12
+            ):
                 raise TranslationError(
-                    f"unexpected side-by-side page size: {width:.1f} x {height:.1f} points"
+                    f"unexpected {output_mode} page size: {width:.1f} x {height:.1f} points; "
+                    f"expected {expected_width:.1f} x {expected_height:.1f}"
                 )
         if translation_pages:
             sample_indexes = [
@@ -215,25 +253,40 @@ def terminate(process: subprocess.Popen[str] | None) -> None:
         process.wait(timeout=10)
 
 
-def find_output(output_dir: Path, before: set[Path], final: Path) -> Path:
+def find_output(
+    output_dir: Path,
+    before: set[Path],
+    final: Path,
+    output_mode: str = "bilingual",
+) -> Path:
     if final.is_file():
         return final
     candidates = [
         path
         for path in output_dir.rglob("*.pdf")
-        if path not in before and path.resolve() != final.resolve()
+        if path not in before
+        and path.resolve() != final.resolve()
+        and not path.name.endswith(".decompressed.pdf")
     ]
     if not candidates:
         raise TranslationError(f"no new PDF found under {output_dir}")
+    keywords = ("mono",) if output_mode == "translated-only" else ("dual", "bilingual")
     preferred = [
-        path for path in candidates if any(word in path.name.lower() for word in ("dual", "bilingual"))
+        path
+        for path in candidates
+        if any(word in path.name.lower() for word in keywords)
     ]
+    primary = [path for path in preferred if ".no_watermark." not in path.name.lower()]
+    if len(primary) == 1:
+        return primary[0]
     if len(preferred) == 1:
         return preferred[0]
     if len(candidates) == 1:
         return candidates[0]
     names = ", ".join(str(path) for path in candidates)
-    raise TranslationError(f"could not identify the bilingual BabelDOC output among: {names}")
+    raise TranslationError(
+        f"could not identify the {output_mode} BabelDOC output among: {names}"
+    )
 
 
 def run_translation(args: argparse.Namespace) -> int:
@@ -242,7 +295,7 @@ def run_translation(args: argparse.Namespace) -> int:
     if not DEFAULT_GLOSSARY.is_file():
         raise TranslationError(f"glossary does not exist: {DEFAULT_GLOSSARY}")
     args.output_dir = args.output_dir.expanduser().resolve()
-    final_path = args.output_dir / f"{input_path.stem}.en-zh.side-by-side.pdf"
+    final_path = final_output_path(input_path, args.output_dir, args.output_mode)
     bridge_backend = args.backend in BRIDGE_BACKENDS
     qps = args.qps if args.qps is not None else (1 if bridge_backend else 2)
     if qps < 1:
@@ -283,6 +336,9 @@ def run_translation(args: argparse.Namespace) -> int:
         "api_key_env": key_env if args.backend == "openai-compatible" else None,
         "api_key_configured": bool(os.environ.get(key_env)) if args.backend == "openai-compatible" else None,
         "qps": qps,
+        "output_mode": args.output_mode,
+        "babeldoc_no_mono": args.output_mode == "bilingual",
+        "babeldoc_no_dual": args.output_mode == "translated-only",
         "output_dir": str(args.output_dir),
         "output_file": str(final_path),
         "auth_file": str(auth_file) if bridge_backend else None,
@@ -337,6 +393,7 @@ def run_translation(args: argparse.Namespace) -> int:
                 output_dir=args.output_dir,
                 model=model_for_babeldoc,
                 qps=qps,
+                output_mode=args.output_mode,
             ),
             encoding="utf-8",
         )
@@ -348,10 +405,19 @@ def run_translation(args: argparse.Namespace) -> int:
         completed = subprocess.run([args.babeldoc, "--config", str(config_path), "--files", str(input_path), *(["--pages", args.pages] if args.pages else [])], cwd=ROOT)
         if completed.returncode != 0:
             raise TranslationError(f"BabelDOC failed with exit status {completed.returncode}")
-        source_output = find_output(args.output_dir, before, final_path)
+        source_output = find_output(
+            args.output_dir, before, final_path, args.output_mode
+        )
         explicit_pages = parse_explicit_pages(args.pages)
         expected_pages = page_count_from_pdf(input_path)
-        validate_output(source_output, expected_pages, explicit_pages)
+        source_size = page_size_from_pdf(input_path)
+        validate_output(
+            source_output,
+            expected_pages,
+            explicit_pages,
+            output_mode=args.output_mode,
+            source_size=source_size,
+        )
         if source_output.resolve() != final_path.resolve():
             if final_path.exists():
                 raise TranslationError(f"refusing to overwrite existing output: {final_path}")
