@@ -65,6 +65,36 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("max-pages-per-part", page_limited)
 
 
+class ConcurrencyAndGlossaryTests(unittest.TestCase):
+    def test_concurrency_sets_worker_pools(self) -> None:
+        args = argparse.Namespace(debug=False, pages=None, concurrency=4, glossary=None)
+        config = translate_pdf.build_config(
+            args,
+            api_key="local-token",
+            base_url="http://127.0.0.1:1234/v1",
+            output_dir=Path("/tmp"),
+            model="claude-code/sonnet",
+            qps=4,
+        )
+        self.assertIn("pool-max-workers = 4", config)
+        self.assertIn("term-pool-max-workers = 4", config)
+        self.assertIn("qps = 4", config)
+
+    def test_custom_glossary_is_used(self) -> None:
+        glossary = ROOT / "glossary" / "testing-genai-en-zh.csv"
+        args = argparse.Namespace(debug=False, pages=None, concurrency=1, glossary=glossary)
+        config = translate_pdf.build_config(
+            args,
+            api_key="local-token",
+            base_url="http://127.0.0.1:1234/v1",
+            output_dir=Path("/tmp"),
+            model="test/model",
+            qps=1,
+        )
+        self.assertIn("testing-genai-en-zh.csv", config)
+        self.assertIn("pool-max-workers = 1", config)
+
+
 class FinalPathTests(unittest.TestCase):
     def test_bilingual_final_path_is_unchanged(self) -> None:
         path = translate_pdf.final_output_path(

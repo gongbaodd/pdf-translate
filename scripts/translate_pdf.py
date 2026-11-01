@@ -63,6 +63,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", help="OpenAI-compatible /v1 endpoint for direct mode")
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
     parser.add_argument("--qps", type=int)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Parallel bridge requests and BabelDOC workers (1-16); useful with --backend claude-code",
+    )
+    parser.add_argument(
+        "--glossary",
+        type=Path,
+        default=DEFAULT_GLOSSARY,
+        help="Glossary CSV (source,target) passed to BabelDOC",
+    )
     parser.add_argument("--auth-file", type=Path)
     parser.add_argument("--babeldoc", default="babeldoc", help="BabelDOC executable")
     parser.add_argument(
@@ -122,7 +134,8 @@ def build_config(
     qps: int,
     output_mode: str = "bilingual",
 ) -> str:
-    glossary = DEFAULT_GLOSSARY.resolve()
+    glossary = Path(getattr(args, "glossary", None) or DEFAULT_GLOSSARY).expanduser().resolve()
+    workers = getattr(args, "concurrency", 1) or 1
     lines = [
         "[babeldoc]",
         *(["debug = true"] if args.debug else []),
@@ -137,8 +150,8 @@ def build_config(
         *(["no-dual = true"] if output_mode == "translated-only" else ["no-mono = true"]),
         'watermark-output-mode = "no_watermark"',
         *(["max-pages-per-part = 25"] if not args.pages else []),
-        "pool-max-workers = 1",
-        "term-pool-max-workers = 1",
+        f"pool-max-workers = {workers}",
+        f"term-pool-max-workers = {workers}",
         f"glossary-files = {toml_string(str(glossary))}",
         "enable-json-mode-if-requested = false",
         "report-interval = 1.0",
@@ -307,12 +320,16 @@ def find_output(
 def run_translation(args: argparse.Namespace) -> int:
     input_path = validate_input(args.input)
     check_executable(args.babeldoc, "BabelDOC")
-    if not DEFAULT_GLOSSARY.is_file():
-        raise TranslationError(f"glossary does not exist: {DEFAULT_GLOSSARY}")
+    glossary_path = Path(getattr(args, "glossary", None) or DEFAULT_GLOSSARY).expanduser().resolve()
+    if not glossary_path.is_file():
+        raise TranslationError(f"glossary does not exist: {glossary_path}")
+    concurrency = getattr(args, "concurrency", 1) or 1
+    if not 1 <= concurrency <= 16:
+        raise TranslationError("--concurrency must be between 1 and 16")
     args.output_dir = args.output_dir.expanduser().resolve()
     final_path = final_output_path(input_path, args.output_dir, args.output_mode)
     bridge_backend = args.backend in BRIDGE_BACKENDS
-    qps = args.qps if args.qps is not None else (1 if bridge_backend else 2)
+    qps = args.qps if args.qps is not None else (concurrency if bridge_backend else max(2, concurrency))
     if qps < 1:
         raise TranslationError("--qps must be at least 1")
     if bridge_backend and args.base_url:
@@ -355,6 +372,8 @@ def run_translation(args: argparse.Namespace) -> int:
         "api_key_env": key_env if args.backend == "openai-compatible" else None,
         "api_key_configured": bool(os.environ.get(key_env)) if args.backend == "openai-compatible" else None,
         "qps": qps,
+        "concurrency": concurrency,
+        "glossary": str(glossary_path),
         "output_mode": args.output_mode,
         "babeldoc_no_mono": args.output_mode == "bilingual",
         "babeldoc_no_dual": args.output_mode == "translated-only",
@@ -390,6 +409,8 @@ def run_translation(args: argparse.Namespace) -> int:
                     args.backend,
                     "--model",
                     args.model,
+                    "--concurrency",
+                    str(concurrency),
                     *(
                         ["--claude-bin", claude_bin]
                         if args.backend == "claude-code"

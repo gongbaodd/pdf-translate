@@ -275,7 +275,7 @@ function responseFrom(bridgeModel, response, text) {
 function errorStatus(error) {
   const message = error instanceof Error ? error.message : String(error);
   if (/401|unauthori|credential|oauth|login/i.test(message)) return 401;
-  if (/429|rate.?limit|quota|usage limit|too many/i.test(message)) return 429;
+  if (/429|rate.?limit|quota|usage limit|too many|hit your .*limit|limit reached|limit · resets/i.test(message)) return 429;
   if (/timeout|aborted|cancel/i.test(message)) return 504;
   return 502;
 }
@@ -546,6 +546,10 @@ async function runServer(args) {
   if (!token || token.length < 32) throw new Error("BABELDOC_BRIDGE_TOKEN must be a random local bearer token");
   const runtime = await createRuntime(args);
   const expectedAliases = new Set([runtime.modelId, `${runtime.provider.aliasPrefix}${runtime.modelId}`]);
+  const concurrency = Number(args.concurrency || 1);
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 16) {
+    throw new Error("--concurrency must be an integer between 1 and 16");
+  }
   let active = 0;
   const queued = [];
   const server = createServer(async (request, response) => {
@@ -555,7 +559,7 @@ async function runServer(args) {
       response.end(JSON.stringify(body));
     };
     if (request.method === "GET" && pathname === "/healthz") {
-      write(200, { status: "ok", provider: runtime.provider.id, model: runtime.modelId, active });
+      write(200, { status: "ok", provider: runtime.provider.id, model: runtime.modelId, active, concurrency });
       return;
     }
     if (request.method !== "POST" || pathname !== "/v1/chat/completions") {
@@ -568,8 +572,8 @@ async function runServer(args) {
       return;
     }
     const slot = Promise.withResolvers();
-    if (active === 0) {
-      active = 1;
+    if (active < concurrency) {
+      active += 1;
       slot.resolve();
     } else {
       queued.push(slot);
@@ -598,7 +602,7 @@ async function runServer(args) {
       if (next) {
         next.resolve();
       } else {
-        active = 0;
+        active -= 1;
       }
     }
   });
@@ -709,6 +713,7 @@ async function main() {
 
 export {
   claudeCodeArgs,
+  errorStatus,
   claudeCodeEnvironment,
   completeClaudeCodeRequest,
   completeRequest,

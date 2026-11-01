@@ -1,0 +1,40 @@
+source,target
+large language model,大语言模型
+LLM,LLM
+generative AI,生成式 AI
+prompt engineering,提示工程
+prompt,提示词
+hallucination,幻觉
+retrieval-augmented generation,检索增强生成
+RAG,RAG
+fine-tuning,微调
+AI agent,AI 智能体
+agent,智能体
+embedding,嵌入
+vector database,向量数据库
+token,token
+few-shot prompting,少样本提示
+exploratory testing,探索性测试
+test-driven development,测试驱动开发
+TDD,TDD
+unit test,单元测试
+test case,测试用例
+test data,测试数据
+test plan,测试计划
+test planning,测试计划制定
+test automation,测试自动化
+UI automation,UI 自动化
+automation bias,自动化偏见
+regression testing,回归测试
+acceptance criteria,验收标准
+user story,用户故事
+risk-based testing,基于风险的测试
+test oracle,测试预言
+mock,模拟对象
+stub,桩
+refactoring,重构
+page object,页面对象
+data provenance,数据来源
+data privacy,数据隐私
+repository,代码仓库
+pipeline,流水线

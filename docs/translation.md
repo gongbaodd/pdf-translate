@@ -163,6 +163,17 @@ Behavior:
   ("usage limit reached") are returned to BabelDOC as HTTP 429, sign-in errors
   as HTTP 401.
 
+Parallelism: `--concurrency N` (1-16, default 1) lets the bridge run N
+requests at once and sets BabelDOC's `pool-max-workers`,
+`term-pool-max-workers`, and default `qps` to N. With `claude-code`,
+`--concurrency 6` translated a 306-page book at roughly 4-5 minutes per
+25-page part. Keep the default of 1 for the pi-ai backends unless the
+provider tolerates parallel requests.
+
+Glossary: `--glossary PATH` replaces the default DDD glossary
+(`glossary/ddd-en-zh.csv`). Use `glossary/testing-genai-en-zh.csv` for
+software-testing / LLM books, or add a new `source,target` CSV per book.
+
 Limits: every request starts a new CLI process (about 5 seconds each) and
 carries Claude Code's base context, mostly served from the prompt cache.
 A full book is thousands of requests, so expect a long run and noticeable

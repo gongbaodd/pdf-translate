@@ -122,7 +122,9 @@ uv run python scripts/translate_pdf.py \
 ```
 
 `--model` accepts Claude Code aliases (`haiku`, `sonnet`, `opus`) or full model
-IDs. See [`docs/translation.md`](docs/translation.md#claude-code-cli) for
+IDs. Add `--concurrency 6` to run several `claude` processes in
+parallel and `--glossary glossary/testing-genai-en-zh.csv` to swap the default
+DDD glossary. See [`docs/translation.md`](docs/translation.md#claude-code-cli) for
 details and limits.
 
 Direct API mode bypasses the bridge:

@@ -9,6 +9,7 @@ import {
   completeClaudeCodeRequest,
   completeRequest,
   createCredentialStore,
+  errorStatus,
   parseClaudeCodeResult,
   requestText,
   runClaudeCode,
@@ -213,4 +214,10 @@ test("runClaudeCode feeds stdin to the process and honors aborts", async () => {
     runClaudeCode({ command: "definitely-not-a-claude-binary", args: [], input: "", timeoutMs: 5_000, cwd: process.cwd(), env: process.env }),
     /executable not found/,
   );
+});
+
+test("maps Claude subscription limit messages to HTTP 429", () => {
+  assert.equal(errorStatus(new Error("Claude Code CLI error: You've hit your 5-hour limit · resets 7:50pm (Europe/Tallinn)")), 429);
+  assert.equal(errorStatus(new Error("Claude Code CLI error: Claude AI usage limit reached")), 429);
+  assert.equal(errorStatus(new Error("Claude Code CLI exited with status 1: Error: No messages returned from query")), 502);
 });
