@@ -346,6 +346,13 @@ Implemented on 2026-10-29:
 - Bilingual regression sample passed:
   - `output/bilingual-check/learningdomain-drivendesign.en-zh.side-by-side.pdf`
   - 342 pages, 1008 x 661.5 points.
-- Full 342-page translated-only export has not been run. It remains the explicit
-  execution gate described in step 9.
+- Full 342-page translated-only export completed with `gpt-6-luna`:
+  - `output/pdf/learningdomain-drivendesign.zh.mono.pdf`
+  - 342 pages, 504 x 661.5 points, 24 MB
+  - 326 pages contain CJK text; the 16 pages without CJK have no
+    source text (blank or image-only pages).
+  - Representative pages 1, 31, 81, 151, 200, and 300 were inspected; diagrams
+    are preserved and pages 31/81/151/200 show Chinese text without side-by-side
+    spreads.
+  - Translation took 1077.75 seconds and used 346,643 total tokens.
 

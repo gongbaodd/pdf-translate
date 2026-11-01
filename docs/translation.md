@@ -74,10 +74,12 @@ output/another-book/another-book.en-zh.side-by-side.pdf
 
 ## Provider backends
 
-The bridge supports ChatGPT/Codex OAuth through pi-ai's `openai-codex` provider
-and OpenCode Go API keys through pi-ai's `opencode-go` provider. Neither route
-uses `OPENAI_API_KEY` or invokes the Codex coding-agent CLI. Credentials are
-stored outside the repository in provider-specific files:
+The bridge supports ChatGPT/Codex OAuth through pi-ai's `openai-codex` provider,
+OpenCode Go API keys through pi-ai's `opencode-go` provider, and a Claude
+subscription through the local Claude Code CLI (`claude-code`, see below).
+The pi-ai routes do not use `OPENAI_API_KEY` or invoke the Codex coding-agent
+CLI. Their credentials are stored outside the repository in provider-specific
+files:
 
 - Codex: `~/.config/babeldoc-codex/auth.json`
 - OpenCode Go: `~/.config/babeldoc-opencode-go/auth.json`
@@ -116,6 +118,57 @@ List pinned models from either installed provider catalog:
 ```bash
 node --input-type=module -e 'import { opencodeGoProvider } from "@earendil-works/pi-ai/providers/opencode-go"; console.log(opencodeGoProvider().getModels().map(model => model.id).join("\n"))'
 ```
+
+### Claude Code CLI
+
+The `claude-code` backend uses your Claude Pro/Max subscription by running the
+official Claude Code CLI (`claude -p`) once per BabelDOC request. It does not
+use pi-ai or store any credential of its own: Claude Code keeps its own sign-in.
+This is the supported way to spend subscription usage from a script; logging a
+third-party tool into a Claude subscription via OAuth is not permitted by
+Anthropic's terms.
+
+Sign in once, interactively, with your subscription account:
+
+```bash
+claude        # then run /login and choose your Claude subscription
+```
+
+Translate a sample:
+
+```bash
+uv run python scripts/translate_pdf.py \
+  --backend claude-code \
+  --model sonnet \
+  --pages 31,81,151 \
+  --output-dir output/claude-code-sample
+```
+
+Behavior:
+
+- `--model` takes a Claude Code alias (`haiku`, `sonnet`, `opus`) or a full
+  model ID; the BabelDOC alias is `claude-code/<model>`.
+- Each request runs `claude -p --output-format json --tools "" --system-prompt
+  ... --no-session-persistence --strict-mcp-config --setting-sources ""
+  --disable-slash-commands` from an empty temporary directory, so no tools,
+  MCP servers, settings, or project `CLAUDE.md` are loaded. BabelDOC's text is
+  sent on stdin.
+- `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are removed from the CLI's
+  environment so usage goes to the signed-in subscription rather than API
+  billing. `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) is kept.
+- Use `--claude-bin /path/to/claude` (or `CLAUDE_BIN`) when `claude` is not on
+  `PATH`. `--auth-file` is rejected for this backend, and
+  `npm run login -- --provider claude-code` only prints sign-in instructions.
+- Each request is limited to 10 minutes. Subscription limit errors
+  ("usage limit reached") are returned to BabelDOC as HTTP 429, sign-in errors
+  as HTTP 401.
+
+Limits: every request starts a new CLI process (about 5 seconds each) and
+carries Claude Code's base context, mostly served from the prompt cache.
+A full book is thousands of requests, so expect a long run and noticeable
+subscription usage. Start with `--pages`, prefer `haiku` or `sonnet` for bulk
+work, and rerun after a limit reset: BabelDOC's translation cache skips text
+that was already translated.
 
 Run a no-network configuration check first. `--dry-run` does not start the
 bridge, refresh credentials, or call BabelDOC:

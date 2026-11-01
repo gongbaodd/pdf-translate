@@ -6,6 +6,7 @@ The root project translates English PDFs into English/Simplified-Chinese side-by
 
 - Codex OAuth through `openai-codex`
 - OpenCode Go API keys through `opencode-go`
+- A Claude Pro/Max subscription through the local Claude Code CLI (`claude-code`)
 - Direct OpenAI-compatible endpoints through BabelDOC
 
 `pi-cast/` is a separate Apple Silicon podcast/video pipeline.
@@ -106,6 +107,23 @@ uv run python scripts/translate_pdf.py \
 ```
 
 The wrapper starts a loopback-only bridge, uses a random per-run bearer token between BabelDOC and the bridge, limits bridge concurrency to one request, and terminates the bridge after the run. OpenCode Go requests receive a stable `x-opencode-session` header for the bridge run.
+
+Use your Claude subscription through the Claude Code CLI. There is no bridge
+login; sign in once with `claude` (`/login`) and the bridge runs `claude -p`
+for each BabelDOC request:
+
+```bash
+uv run python scripts/translate_pdf.py \
+  /path/to/input.pdf \
+  --backend claude-code \
+  --model sonnet \
+  --pages 31,81,151 \
+  --output-dir output/claude-code-sample
+```
+
+`--model` accepts Claude Code aliases (`haiku`, `sonnet`, `opus`) or full model
+IDs. See [`docs/translation.md`](docs/translation.md#claude-code-cli) for
+details and limits.
 
 Direct API mode bypasses the bridge:
 

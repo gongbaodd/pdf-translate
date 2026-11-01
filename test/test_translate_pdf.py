@@ -237,6 +237,63 @@ class DryRunTests(unittest.TestCase):
         self.assertNotIn("BABELDOC_BRIDGE_TOKEN", serialized)
         self.assertNotIn("api-key", serialized)
 
+    def test_claude_code_dry_run_uses_bridge_without_auth_file(self) -> None:
+        babeldoc = ROOT / ".venv" / "bin" / "babeldoc"
+        if not babeldoc.is_file() or shutil.which("node") is None:
+            self.skipTest("local BabelDOC or Node.js is unavailable")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            input_pdf = touch_pdf(Path(tempdir) / "input.pdf")
+            args = argparse.Namespace(
+                input=input_pdf,
+                backend="claude-code",
+                pages="1",
+                output_dir=Path(tempdir) / "out",
+                model="sonnet",
+                base_url=None,
+                api_key_env="OPENAI_API_KEY",
+                qps=None,
+                auth_file=None,
+                babeldoc=str(babeldoc),
+                claude_bin="node",
+                debug=False,
+                dry_run=True,
+                output_mode="bilingual",
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                status = translate_pdf.run_translation(args)
+
+        self.assertEqual(status, 0)
+        configuration = json.loads(stdout.getvalue())
+        self.assertEqual(configuration["babeldoc_model"], "claude-code/sonnet")
+        self.assertEqual(configuration["qps"], 1)
+        self.assertIsNone(configuration["auth_file"])
+        self.assertEqual(configuration["claude_bin"], "node")
+        self.assertTrue(configuration["base_url"].startswith("http://127.0.0.1:"))
+
+    def test_claude_code_rejects_auth_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            input_pdf = touch_pdf(Path(tempdir) / "input.pdf")
+            args = argparse.Namespace(
+                input=input_pdf,
+                backend="claude-code",
+                pages=None,
+                output_dir=Path(tempdir) / "out",
+                model="sonnet",
+                base_url=None,
+                api_key_env="OPENAI_API_KEY",
+                qps=None,
+                auth_file=Path(tempdir) / "auth.json",
+                babeldoc=shutil.which("true") or "true",
+                claude_bin="node",
+                debug=False,
+                dry_run=True,
+                output_mode="bilingual",
+            )
+            with self.assertRaisesRegex(translate_pdf.TranslationError, "auth-file"):
+                translate_pdf.run_translation(args)
+
 
 if __name__ == "__main__":
     unittest.main()

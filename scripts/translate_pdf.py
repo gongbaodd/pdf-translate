@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run BabelDOC with pi-ai Codex OAuth, OpenCode Go, or a direct OpenAI-compatible API."""
+"""Run BabelDOC with pi-ai Codex OAuth, OpenCode Go, the Claude Code CLI, or a direct OpenAI-compatible API."""
 
 from __future__ import annotations
 
@@ -29,7 +29,13 @@ DEFAULT_OPENCODE_GO_AUTH_FILE = Path(
 BRIDGE_SCRIPT = ROOT / "scripts" / "translation_bridge.ts"
 CODEX_ALIAS_PREFIX = "pi-codex-v1/"
 OPENCODE_GO_ALIAS_PREFIX = "opencode-go/"
-BRIDGE_BACKENDS = frozenset(("codex", "opencode-go"))
+CLAUDE_CODE_ALIAS_PREFIX = "claude-code/"
+ALIAS_PREFIXES = {
+    "codex": CODEX_ALIAS_PREFIX,
+    "opencode-go": OPENCODE_GO_ALIAS_PREFIX,
+    "claude-code": CLAUDE_CODE_ALIAS_PREFIX,
+}
+BRIDGE_BACKENDS = frozenset(ALIAS_PREFIXES)
 OUTPUT_MODES = ("bilingual", "translated-only")
 
 
@@ -40,7 +46,11 @@ class TranslationError(RuntimeError):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", nargs="?", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--backend", choices=("codex", "opencode-go", "openai-compatible"), default="codex")
+    parser.add_argument(
+        "--backend",
+        choices=("codex", "opencode-go", "claude-code", "openai-compatible"),
+        default="codex",
+    )
     parser.add_argument("--pages", help="BabelDOC page selector, for example 31,81,151")
     parser.add_argument(
         "--output-mode",
@@ -55,6 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qps", type=int)
     parser.add_argument("--auth-file", type=Path)
     parser.add_argument("--babeldoc", default="babeldoc", help="BabelDOC executable")
+    parser.add_argument(
+        "--claude-bin",
+        default=os.environ.get("CLAUDE_BIN", "claude"),
+        help="Claude Code CLI executable for --backend claude-code",
+    )
     parser.add_argument("--debug", action="store_true", help="Preserve BabelDOC tracebacks and debug artifacts")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -308,12 +323,16 @@ def run_translation(args: argparse.Namespace) -> int:
     if args.backend == "openai-compatible" and not args.dry_run and not api_key:
         raise TranslationError(f"missing API key in environment variable {key_env}")
     auth_file = auth_file_for(args)
+    claude_bin = getattr(args, "claude_bin", None) or "claude"
+    if args.backend == "claude-code" and args.auth_file:
+        raise TranslationError("--auth-file is not used with --backend claude-code; sign in with `claude` instead")
     if bridge_backend:
         check_node()
         if not BRIDGE_SCRIPT.is_file():
             raise TranslationError(f"provider bridge does not exist: {BRIDGE_SCRIPT}")
-        alias_prefix = CODEX_ALIAS_PREFIX if args.backend == "codex" else OPENCODE_GO_ALIAS_PREFIX
-        model_for_babeldoc = f"{alias_prefix}{args.model}"
+        if args.backend == "claude-code":
+            check_executable(claude_bin, "Claude Code CLI")
+        model_for_babeldoc = f"{ALIAS_PREFIXES[args.backend]}{args.model}"
         base_url = "http://127.0.0.1:<ephemeral-port>/v1"
         api_key = "<per-run-local-bearer-token>"
     else:
@@ -341,7 +360,8 @@ def run_translation(args: argparse.Namespace) -> int:
         "babeldoc_no_dual": args.output_mode == "translated-only",
         "output_dir": str(args.output_dir),
         "output_file": str(final_path),
-        "auth_file": str(auth_file) if bridge_backend else None,
+        "auth_file": str(auth_file) if auth_file else None,
+        "claude_bin": claude_bin if args.backend == "claude-code" else None,
         "command": command_preview,
     }
     if args.dry_run:
@@ -370,8 +390,11 @@ def run_translation(args: argparse.Namespace) -> int:
                     args.backend,
                     "--model",
                     args.model,
-                    "--auth-file",
-                    str(auth_file),
+                    *(
+                        ["--claude-bin", claude_bin]
+                        if args.backend == "claude-code"
+                        else ["--auth-file", str(auth_file)]
+                    ),
                 ],
                 cwd=ROOT,
                 env=environment,

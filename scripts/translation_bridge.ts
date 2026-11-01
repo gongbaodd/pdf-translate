@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
+import { spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline/promises";
@@ -28,10 +30,26 @@ const PROVIDERS = {
     defaultAuthFile: "babeldoc-opencode-go",
     create: opencodeGoProvider,
   },
+  "claude-code": {
+    id: "claude-code",
+    name: "Claude Code CLI",
+    aliasPrefix: "claude-code/",
+    kind: "cli",
+  },
 };
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const LOCK_TIMEOUT_MS = 30_000;
 const STALE_LOCK_MS = 5 * 60_000;
+const CLAUDE_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:\-\[\]]*$/;
+const DEFAULT_CLAUDE_TIMEOUT_MS = 10 * 60_000;
+const MAX_CLI_OUTPUT_BYTES = 8 * 1024 * 1024;
+const CLAUDE_TRANSLATION_GUARD =
+  "You are a translation engine called by a PDF layout pipeline. " +
+  "Follow the instructions below exactly and output only the requested text, " +
+  "with no commentary, explanations, or markdown fences.";
+// Environment variables that would make Claude Code bill an API account
+// instead of using the signed-in Claude subscription.
+const CLAUDE_API_BILLING_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
 
 function parseArgs(argv) {
   const result = { _: [] };
@@ -262,7 +280,7 @@ function errorStatus(error) {
   return 502;
 }
 
-async function completeRequest(models, model, body, signal, sessionId) {
+function validateBody(body) {
   if (body.stream === true) throw new Error("streaming is not supported by the BabelDOC bridge");
   if (body.tools || body.tool_choice || body.response_format) {
     throw new Error("tools, tool_choice, and response_format are not supported");
@@ -273,7 +291,10 @@ async function completeRequest(models, model, body, signal, sessionId) {
   if (body.max_tokens !== undefined && (!Number.isInteger(body.max_tokens) || body.max_tokens < 1)) {
     throw new Error("max_tokens must be a positive integer");
   }
+}
 
+async function completeRequest(models, model, body, signal, sessionId) {
+  validateBody(body);
   const { systemPrompt, userText } = requestText(body.messages);
   const context = {
     ...(systemPrompt ? { systemPrompt } : {}),
@@ -302,11 +323,182 @@ async function completeRequest(models, model, body, signal, sessionId) {
   return responseFrom(body.model, response, text);
 }
 
+function claudeCodeArgs(modelId, systemPrompt) {
+  return [
+    "-p",
+    "--output-format",
+    "json",
+    "--model",
+    modelId,
+    "--tools",
+    "",
+    "--system-prompt",
+    systemPrompt ? `${CLAUDE_TRANSLATION_GUARD}\n\n${systemPrompt}` : CLAUDE_TRANSLATION_GUARD,
+    "--no-session-persistence",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "",
+    "--disable-slash-commands",
+  ];
+}
+
+function claudeCodeEnvironment(environment = process.env) {
+  const next = { ...environment };
+  for (const name of CLAUDE_API_BILLING_ENV) delete next[name];
+  delete next.BABELDOC_BRIDGE_TOKEN;
+  return next;
+}
+
+function runClaudeCode({ command, args, input: stdinText, signal, timeoutMs, cwd, env }) {
+  const { promise, resolve: resolveRun, reject: rejectRun } = Promise.withResolvers();
+  let child;
+  try {
+    child = spawn(command, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+  } catch (error) {
+    rejectRun(new Error(`Claude Code CLI could not start: ${error instanceof Error ? error.message : String(error)}`));
+    return promise;
+  }
+  const stdout = [];
+  const stderr = [];
+  let size = 0;
+  let settled = false;
+  const finish = (callback) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+    callback();
+  };
+  const stop = (message) => {
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
+    finish(() => rejectRun(new Error(message)));
+  };
+  const onAbort = () => stop("Claude Code CLI request aborted");
+  const timer = setTimeout(() => stop(`Claude Code CLI timeout after ${timeoutMs} ms`), timeoutMs);
+  if (signal?.aborted) onAbort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const collect = (target) => (chunk) => {
+    size += chunk.length;
+    if (size > MAX_CLI_OUTPUT_BYTES) {
+      stop("Claude Code CLI output too large");
+      return;
+    }
+    target.push(chunk);
+  };
+  child.stdout.on("data", collect(stdout));
+  child.stderr.on("data", collect(stderr));
+  child.once("error", (error) => {
+    const detail = error?.code === "ENOENT" ? `executable not found: ${command}` : error.message;
+    finish(() => rejectRun(new Error(`Claude Code CLI could not start: ${detail}`)));
+  });
+  child.once("close", (code) => {
+    finish(() =>
+      resolveRun({
+        code,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      }),
+    );
+  });
+  child.stdin.on("error", () => {});
+  child.stdin.end(stdinText);
+  return promise;
+}
+
+function parseClaudeCodeResult({ code, stdout, stderr }) {
+  const detail = (text) => String(text || "").trim().slice(0, 500);
+  let data;
+  try {
+    data = JSON.parse(String(stdout || "").trim());
+  } catch {
+    throw new Error(`Claude Code CLI exited with status ${code}: ${detail(stderr) || detail(stdout) || "no output"}`);
+  }
+  if (!data || typeof data !== "object" || data.type !== "result") {
+    throw new Error(`Claude Code CLI returned an unexpected payload: ${detail(stdout)}`);
+  }
+  if (data.is_error || data.subtype !== "success") {
+    const reason = detail(data.result) || detail(stderr) || String(data.subtype || "unknown error");
+    throw new Error(`Claude Code CLI error: ${reason}`);
+  }
+  if (data.stop_reason === "max_tokens") throw new Error("completion was truncated by the output limit");
+  const text = String(data.result ?? "").trim();
+  if (!text) throw new Error("provider returned empty translated text");
+  const usage = data.usage || {};
+  const inputTokens =
+    Number(usage.input_tokens || 0) +
+    Number(usage.cache_creation_input_tokens || 0) +
+    Number(usage.cache_read_input_tokens || 0);
+  const outputTokens = Number(usage.output_tokens || 0);
+  return {
+    text,
+    response: {
+      stopReason: "stop",
+      usage: { input: inputTokens, output: outputTokens, totalTokens: inputTokens + outputTokens },
+    },
+  };
+}
+
+async function completeClaudeCodeRequest(runtime, body, signal, run = runClaudeCode) {
+  validateBody(body);
+  const { systemPrompt, userText } = requestText(body.messages);
+  const result = await run({
+    command: runtime.command,
+    args: claudeCodeArgs(runtime.modelId, systemPrompt),
+    input: userText,
+    signal,
+    timeoutMs: runtime.timeoutMs,
+    cwd: runtime.cwd,
+    env: claudeCodeEnvironment(),
+  });
+  const { text, response } = parseClaudeCodeResult(result);
+  return responseFrom(body.model, response, text);
+}
+
+async function createClaudeCodeRuntime(args, provider, providerName, modelId) {
+  if (!CLAUDE_MODEL_PATTERN.test(modelId)) {
+    throw new Error(`invalid Claude model ${modelId}; use an alias such as sonnet, opus, haiku, or a full model ID`);
+  }
+  const command = String(args["claude-bin"] || process.env.CLAUDE_BIN || "claude");
+  const timeoutMs = Number(args["timeout-ms"] || DEFAULT_CLAUDE_TIMEOUT_MS);
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000) throw new Error("--timeout-ms must be an integer >= 1000");
+  const version = await runClaudeCode({
+    command,
+    args: ["--version"],
+    input: "",
+    timeoutMs: 30_000,
+    cwd: process.cwd(),
+    env: claudeCodeEnvironment(),
+  });
+  if (version.code !== 0) {
+    throw new Error(`Claude Code CLI preflight failed (status ${version.code}): ${version.stderr.trim() || version.stdout.trim()}`);
+  }
+  for (const name of CLAUDE_API_BILLING_ENV) {
+    if (process.env[name]) {
+      console.error(`translation_bridge: ignoring ${name} so Claude Code uses the signed-in subscription`);
+    }
+  }
+  // Run each request from an empty directory so no project CLAUDE.md is picked up.
+  const cwd = await fs.mkdtemp(resolve(tmpdir(), "babeldoc-claude-code-"));
+  return {
+    kind: "cli",
+    command,
+    cliVersion: version.stdout.trim(),
+    cwd,
+    timeoutMs,
+    modelId,
+    provider,
+    providerName,
+    sessionId: randomUUID(),
+  };
+}
+
 async function createRuntime(args) {
   const providerName = String(args.provider || "codex");
   const provider = providerFrom(args);
   const modelId = String(args.model || "");
   if (!modelId) throw new Error("--model is required");
+  if (provider.kind === "cli") return createClaudeCodeRuntime(args, provider, providerName, modelId);
   const authFile = authFileFrom(args);
   const credentials = createCredentialStore(authFile);
   const models = createModels({ credentials });
@@ -388,11 +580,17 @@ async function runServer(args) {
     try {
       const body = await readJson(request);
       if (!body || !expectedAliases.has(body.model)) throw new Error(`unsupported model alias: ${String(body?.model)}`);
-      const result = await completeRequest(runtime.models, runtime.model, body, controller.signal, runtime.sessionId);
+      const result =
+        runtime.kind === "cli"
+          ? await completeClaudeCodeRequest(runtime, body, controller.signal)
+          : await completeRequest(runtime.models, runtime.model, body, controller.signal, runtime.sessionId);
       write(200, result);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = error instanceof Error && /unsupported model alias|messages|content|role|temperature|max_tokens|not supported|JSON/.test(message) ? 400 : errorStatus(error);
+      const clientError =
+        !message.startsWith("Claude Code CLI") &&
+        /unsupported model alias|messages|content|role|temperature|max_tokens|not supported|JSON/.test(message);
+      const status = clientError ? 400 : errorStatus(error);
       console.error(`translation_bridge: request failed with HTTP ${status}: ${message}`);
       write(status, openAIError(message, status === 429 ? "rate_limit_error" : status === 401 ? "authentication_error" : "api_error", "bridge_error"));
     } finally {
@@ -410,7 +608,11 @@ async function runServer(args) {
   await listening.promise;
   const address = server.address();
   process.stdout.write(`${JSON.stringify({ ready: true, port: address.port, model: runtime.modelId })}\n`);
-  const shutdown = () => server.close(() => process.exit(0));
+  const shutdown = () =>
+    server.close(async () => {
+      if (runtime.kind === "cli") await fs.rm(runtime.cwd, { recursive: true, force: true }).catch(() => {});
+      process.exit(0);
+    });
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
   const running = Promise.withResolvers();
@@ -454,6 +656,9 @@ async function promptSecret(rl, message) {
 
 async function runLogin(args) {
   const provider = providerFrom(args);
+  if (provider.kind === "cli") {
+    throw new Error("claude-code uses the Claude Code CLI's own sign-in; run `claude` and use /login with your Claude subscription");
+  }
   const authFile = authFileFrom(args);
   const credentials = createCredentialStore(authFile);
   const models = createModels({ credentials });
@@ -502,7 +707,16 @@ async function main() {
   await runServer(args);
 }
 
-export { completeRequest, createCredentialStore, requestText };
+export {
+  claudeCodeArgs,
+  claudeCodeEnvironment,
+  completeClaudeCodeRequest,
+  completeRequest,
+  createCredentialStore,
+  parseClaudeCodeResult,
+  requestText,
+  runClaudeCode,
+};
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
