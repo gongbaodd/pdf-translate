@@ -1,0 +1,19 @@
+[package]
+name = "pi-docs-desktop"
+version = "0.1.0"
+edition = "2024"
+description = "GPUI desktop app for the pi-docs BabelDOC translation pipeline"
+publish = false
+
+[dependencies]
+# runtime_shaders: compile Metal shaders at startup so building needs no Metal Toolchain.
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+open = "5"
+anyhow = "1"
+unicode-segmentation = "1"
+
+[profile.release]
+lto = "thin"

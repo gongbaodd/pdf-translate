@@ -3,13 +3,17 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
+import { writeFile } from "node:fs/promises";
 import {
   claudeCodeArgs,
   claudeCodeEnvironment,
   completeClaudeCodeRequest,
   completeRequest,
   createCredentialStore,
+  createJsonLoginIO,
   errorStatus,
+  providerStatus,
   parseClaudeCodeResult,
   requestText,
   runClaudeCode,
@@ -220,4 +224,94 @@ test("maps Claude subscription limit messages to HTTP 429", () => {
   assert.equal(errorStatus(new Error("Claude Code CLI error: You've hit your 5-hour limit · resets 7:50pm (Europe/Tallinn)")), 429);
   assert.equal(errorStatus(new Error("Claude Code CLI error: Claude AI usage limit reached")), 429);
   assert.equal(errorStatus(new Error("Claude Code CLI exited with status 1: Error: No messages returned from query")), 502);
+});
+
+function collectLines(stream: PassThrough) {
+  const lines: any[] = [];
+  let buffer = "";
+  stream.on("data", (chunk) => {
+    buffer += chunk.toString();
+    let index;
+    while ((index = buffer.indexOf("\n")) >= 0) {
+      lines.push(JSON.parse(buffer.slice(0, index)));
+      buffer = buffer.slice(index + 1);
+    }
+  });
+  return lines;
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("JSON login IO relays prompts and answers without echoing secrets", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const lines = collectLines(stdout);
+  const io = createJsonLoginIO({ stdin, stdout });
+
+  const secret = io.prompt({ type: "secret", message: "API key" });
+  await tick();
+  assert.deepEqual(lines[0], { v: 1, type: "secret", message: "API key", id: "p1" });
+  stdin.write(`${JSON.stringify({ id: "p1", value: "sk-test-secret" })}\n`);
+  assert.equal(await secret, "sk-test-secret");
+
+  const select = io.prompt({ type: "select", message: "Pick", options: [{ id: "a", label: "A" }] });
+  await tick();
+  assert.equal(lines[1].type, "select");
+  stdin.write(`${JSON.stringify({ id: "p2", value: "zzz" })}\n`);
+  await assert.rejects(select, /invalid login selection/);
+
+  io.notify({ type: "auth_url", url: "https://example.test/auth", instructions: "go" });
+  io.notify({ type: "device_code", verificationUri: "https://example.test/device", userCode: "ABCD" });
+  assert.equal(lines[2].type, "auth_url");
+  assert.deepEqual(lines[3], {
+    v: 1,
+    type: "device_code",
+    verification_uri: "https://example.test/device",
+    user_code: "ABCD",
+  });
+  assert.ok(!JSON.stringify(lines).includes("sk-test-secret"));
+  io.close();
+});
+
+test("JSON login IO rejects pending prompts when stdin closes", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  collectLines(stdout);
+  const io = createJsonLoginIO({ stdin, stdout });
+  const pending = io.prompt({ type: "text", message: "Code" });
+  await tick();
+  stdin.end();
+  await assert.rejects(pending, /login cancelled/);
+});
+
+test("provider status reports credentials without exposing them", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "bridge-status-"));
+  try {
+    const authFile = join(directory, "auth.json");
+    const args = { provider: "opencode-go", "auth-file": authFile };
+    let status = await providerStatus(args);
+    assert.equal(status.signed_in, false);
+
+    await writeFile(authFile, JSON.stringify({ "opencode-go": { type: "api_key", key: "sk-hidden" } }), { mode: 0o600 });
+    status = await providerStatus(args);
+    assert.equal(status.signed_in, true);
+    assert.equal(status.credential_type, "api_key");
+    assert.ok(!JSON.stringify(status).includes("sk-hidden"));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("claude-code status checks the CLI is installed", async () => {
+  const ok = await providerStatus(
+    { provider: "claude-code" },
+    { run: async () => ({ code: 0, stdout: "2.1.0 (Claude Code)\n", stderr: "" }) },
+  );
+  assert.equal(ok.installed, true);
+  assert.equal(ok.version, "2.1.0 (Claude Code)");
+  const missing = await providerStatus(
+    { provider: "claude-code" },
+    { run: async () => { throw new Error("executable not found: claude"); } },
+  );
+  assert.equal(missing.installed, false);
 });

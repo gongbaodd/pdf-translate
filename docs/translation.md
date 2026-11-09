@@ -174,6 +174,11 @@ Glossary: `--glossary PATH` replaces the default DDD glossary
 (`glossary/ddd-en-zh.csv`). Use `glossary/testing-genai-en-zh.csv` for
 software-testing / LLM books, or add a new `source,target` CSV per book.
 
+Code listings: some books set code in a font BabelDOC does not recognize, and
+it then rewraps and translates the listing. Pass `--code-font-pattern 'Courier.*'`
+(a regex of font names) to keep those fonts verbatim. This was needed for
+`Software_Testing_with_Generative_AI.pdf` (code font `CourierStd`).
+
 Limits: every request starts a new CLI process (about 5 seconds each) and
 carries Claude Code's base context, mostly served from the prompt cache.
 A full book is thousands of requests, so expect a long run and noticeable
@@ -286,3 +291,34 @@ glossary, caching, part splitting, and concurrency limits apply.
   changing either dependency.
 - The sample and full run require network access and valid provider credentials;
   no live translation is performed by installation or dry-run commands.
+
+## Machine-readable events (`--events json`)
+
+`translate_pdf.py --events json` writes one JSON object per line to stdout
+(version `v: 1`); BabelDOC output and human messages go to stderr. The desktop
+app uses this. Default `--events text` output is unchanged.
+
+| `type` | Fields |
+| --- | --- |
+| `config` | `config` (same object as `--dry-run`) |
+| `stage` | `stage`: `bridge_starting`, `bridge_ready`, `translating`, `validating` |
+| `progress` | `stage`, optional `current`, `total`, `overall` (0-1); parsed best-effort from BabelDOC's console output |
+| `warning` | `message` |
+| `result` | `output_file`, `pages` |
+| `error` | `code`, `message` |
+
+Error codes: `executable_missing`, `node_version`, `input_missing`,
+`input_invalid`, `glossary_missing`, `invalid_option`, `missing_api_key`,
+`bridge_failed`, `babeldoc_failed`, `output_exists`, `output_not_found`,
+`validation_failed`, `cancelled`, `error`. With `--dry-run`, only a single
+`config` event is written. SIGTERM stops BabelDOC and the bridge cleanly and
+exits with status 130 after a `cancelled` error event.
+
+`translation_bridge.ts login --provider <name> --events json` writes prompts to
+stdout (`select`, `secret`, `text`, `auth_url`, `device_code`, `info`, `done`,
+`error`) and reads answers from stdin as `{"id":"p1","value":"..."}`. Secrets
+are never echoed in events.
+
+`translation_bridge.ts status --provider <name> [--auth-file ...] [--claude-bin ...]`
+prints one `status` line with `installed`, `signed_in` (`null` for Claude Code,
+which keeps its own login) and never prints credentials.

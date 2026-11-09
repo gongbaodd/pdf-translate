@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+
+# Packaging output (see docs/plan/gpui-desktop-app.md, step 6)
+/dist/
+*.app
+*.dmg
+*.msi
+*.AppImage
+
+# Local editor/debug files
+*.pdb
+*.rs.bk
+.DS_Store

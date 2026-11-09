@@ -4,10 +4,11 @@ import { spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { promises as fs } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline/promises";
+import { createInterface as createLineInterface } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
 import { createModels } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
@@ -93,7 +94,7 @@ function providerFrom(args) {
 function authFileFrom(args) {
   const provider = providerFrom(args);
   const defaultFile = resolve(
-    process.env.XDG_CONFIG_HOME || `${process.env.HOME || process.cwd()}/.config`,
+    process.env.XDG_CONFIG_HOME || resolve(homedir(), ".config"),
     provider.defaultAuthFile,
     "auth.json",
   );
@@ -103,11 +104,12 @@ function authFileFrom(args) {
 async function ensurePrivatePath(file) {
   const parent = dirname(file);
   await fs.mkdir(parent, { recursive: true, mode: 0o700 });
-  await fs.chmod(parent, 0o700);
+  if (process.platform !== "win32") await fs.chmod(parent, 0o700);
   try {
     const stat = await fs.lstat(file);
     if (stat.isSymbolicLink()) throw new Error(`refusing symlink credential file: ${file}`);
-    if ((stat.mode & 0o077) !== 0) {
+    // Windows does not expose POSIX permission bits; the profile ACLs apply instead.
+    if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
       throw new Error(`credential file is readable by group/others; run chmod 600 ${file}`);
     }
   } catch (error) {
@@ -658,7 +660,110 @@ async function promptSecret(rl, message) {
   return promise;
 }
 
-async function runLogin(args) {
+const EVENT_PROTOCOL_VERSION = 1;
+
+function createEventWriter(stdout = output) {
+  return (event) => stdout.write(`${JSON.stringify({ v: EVENT_PROTOCOL_VERSION, ...event })}\n`);
+}
+
+// Login prompts as line-delimited JSON: questions go to stdout, answers
+// ({"id","value"}) come back on stdin. Answers are never echoed in events.
+function createJsonLoginIO({ stdin = input, stdout = output } = {}) {
+  const emit = createEventWriter(stdout);
+  const reader = createLineInterface({ input: stdin, terminal: false });
+  const pending = new Map();
+  let counter = 0;
+  let closed = false;
+  reader.on("line", (line) => {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const waiter = pending.get(message?.id);
+    if (!waiter) return;
+    pending.delete(message.id);
+    waiter.resolve(message.value);
+  });
+  reader.on("close", () => {
+    closed = true;
+    for (const waiter of pending.values()) waiter.reject(new Error("login cancelled"));
+    pending.clear();
+  });
+  function ask(event) {
+    if (closed) return Promise.reject(new Error("login cancelled"));
+    counter += 1;
+    const id = `p${counter}`;
+    const { promise, resolve: resolveAnswer, reject } = Promise.withResolvers();
+    pending.set(id, { resolve: resolveAnswer, reject });
+    emit({ ...event, id });
+    return promise;
+  }
+  return {
+    emit,
+    async prompt(prompt) {
+      if (prompt.type === "select") {
+        const options = prompt.options.map((option) => ({ id: option.id, label: option.label }));
+        const answer = await ask({ type: "select", message: prompt.message, options });
+        if (!options.some((option) => option.id === answer)) throw new Error("invalid login selection");
+        return answer;
+      }
+      if (prompt.type === "secret") {
+        return String(await ask({ type: "secret", message: prompt.message }));
+      }
+      return String(await ask({ type: "text", message: prompt.message, placeholder: prompt.placeholder ?? null }));
+    },
+    notify(event) {
+      if (event.type === "auth_url") {
+        emit({ type: "auth_url", url: event.url, instructions: event.instructions ?? null });
+      } else if (event.type === "device_code") {
+        emit({ type: "device_code", verification_uri: event.verificationUri, user_code: event.userCode });
+      } else {
+        emit({ type: "info", message: event.message });
+      }
+    },
+    close() {
+      reader.close();
+    },
+  };
+}
+
+function createConsoleLoginIO() {
+  const rl = createInterface({ input, output });
+  return {
+    async prompt(prompt) {
+      if (prompt.type === "select") {
+        console.log(prompt.message);
+        prompt.options.forEach((option, index) => console.log(`  ${index + 1}. ${option.label}`));
+        const answer = await rl.question(`Choose 1-${prompt.options.length}: `);
+        const selected = prompt.options[Number.parseInt(answer, 10) - 1];
+        if (!selected) throw new Error("invalid login selection");
+        return selected.id;
+      }
+      if (prompt.type === "secret") {
+        return promptSecret(rl, prompt.message);
+      }
+      return rl.question(`${prompt.message}${prompt.placeholder ? ` (${prompt.placeholder})` : ""}: `);
+    },
+    notify(event) {
+      if (event.type === "auth_url") {
+        console.log(`\nOpen this URL in a browser:\n${event.url}`);
+        if (event.instructions) console.log(event.instructions);
+      } else if (event.type === "device_code") {
+        console.log(`\nOpen ${event.verificationUri} and enter ${event.userCode}`);
+      } else {
+        console.log(event.message);
+      }
+    },
+    emit() {},
+    close() {
+      rl.close();
+    },
+  };
+}
+
+async function runLogin(args, loginIO) {
   const provider = providerFrom(args);
   if (provider.kind === "cli") {
     throw new Error("claude-code uses the Claude Code CLI's own sign-in; run `claude` and use /login with your Claude subscription");
@@ -667,45 +772,69 @@ async function runLogin(args) {
   const credentials = createCredentialStore(authFile);
   const models = createModels({ credentials });
   models.setProvider(provider.create());
-  const rl = createInterface({ input, output });
+  const json = args.events === "json";
+  const io = loginIO ?? (json ? createJsonLoginIO() : createConsoleLoginIO());
   try {
     const credential = await models.login(provider.id, provider.loginType, {
-      prompt: async (prompt) => {
-        if (prompt.type === "select") {
-          console.log(prompt.message);
-          prompt.options.forEach((option, index) => console.log(`  ${index + 1}. ${option.label}`));
-          const answer = await rl.question(`Choose 1-${prompt.options.length}: `);
-          const selected = prompt.options[Number.parseInt(answer, 10) - 1];
-          if (!selected) throw new Error("invalid login selection");
-          return selected.id;
-        }
-        if (prompt.type === "secret") {
-          return promptSecret(rl, prompt.message);
-        }
-        return rl.question(`${prompt.message}${prompt.placeholder ? ` (${prompt.placeholder})` : ""}: `);
-      },
-      notify: (event) => {
-        if (event.type === "auth_url") {
-          console.log(`\nOpen this URL in a browser:\n${event.url}`);
-          if (event.instructions) console.log(event.instructions);
-        } else if (event.type === "device_code") {
-          console.log(`\nOpen ${event.verificationUri} and enter ${event.userCode}`);
-        } else {
-          console.log(event.message);
-        }
-      },
+      prompt: (prompt) => io.prompt(prompt),
+      notify: (event) => io.notify(event),
     }, { getDeviceId: randomUUID });
-    console.log(`${provider.name} credentials saved to ${authFile}`);
+    if (json) io.emit({ type: "done", provider: provider.id, auth_file: authFile });
+    else console.log(`${provider.name} credentials saved to ${authFile}`);
     return credential;
   } finally {
-    rl.close();
+    io.close();
   }
+}
+
+// One JSON line describing whether a backend can be used. Never prints credentials.
+async function providerStatus(args, { run = runClaudeCode } = {}) {
+  const provider = providerFrom(args);
+  const name = String(args.provider || "codex");
+  if (provider.kind === "cli") {
+    const command = String(args["claude-bin"] || process.env.CLAUDE_BIN || "claude");
+    try {
+      const result = await run({
+        command,
+        args: ["--version"],
+        input: "",
+        signal: AbortSignal.timeout(10_000),
+        timeoutMs: 10_000,
+        cwd: tmpdir(),
+        env: claudeCodeEnvironment(),
+      });
+      if (result.code !== 0) throw new Error(`${command} --version exited with status ${result.code}`);
+      const version = String(result.stdout ?? "").trim() || null;
+      // Claude Code keeps its own login; whether it is signed in cannot be probed offline.
+      return { type: "status", provider: name, installed: true, signed_in: null, version };
+    } catch (error) {
+      return { type: "status", provider: name, installed: false, signed_in: false, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  const authFile = authFileFrom(args);
+  const credential = await createCredentialStore(authFile).read(provider.id);
+  return {
+    type: "status",
+    provider: name,
+    installed: true,
+    signed_in: credential !== undefined,
+    credential_type: credential?.type ?? null,
+    auth_file: authFile,
+  };
+}
+
+async function runStatus(args) {
+  createEventWriter()(await providerStatus(args));
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args._[0] === "login") {
     await runLogin(args);
+    return;
+  }
+  if (args._[0] === "status") {
+    await runStatus(args);
     return;
   }
   await runServer(args);
@@ -718,11 +847,20 @@ export {
   completeClaudeCodeRequest,
   completeRequest,
   createCredentialStore,
+  createJsonLoginIO,
   parseClaudeCodeResult,
+  providerStatus,
+  runLogin,
   requestText,
   runClaudeCode,
 };
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
-  main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (parseArgs(process.argv.slice(2)).events === "json") {
+      createEventWriter()({ type: "error", code: "login_failed", message });
+    }
+    fail(message);
+  });
 }

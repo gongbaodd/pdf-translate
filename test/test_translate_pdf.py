@@ -80,6 +80,22 @@ class ConcurrencyAndGlossaryTests(unittest.TestCase):
         self.assertIn("term-pool-max-workers = 4", config)
         self.assertIn("qps = 4", config)
 
+    def test_code_font_pattern_extends_default_formula_fonts(self) -> None:
+        args = argparse.Namespace(
+            debug=False, pages=None, concurrency=1, glossary=None, code_font_pattern="Courier.*"
+        )
+        config = translate_pdf.build_config(
+            args,
+            api_key="local-token",
+            base_url="http://127.0.0.1:1234/v1",
+            output_dir=Path("/tmp"),
+            model="test/model",
+            qps=1,
+        )
+        self.assertIn("formular-font-pattern", config)
+        self.assertIn("Courier.*", config)
+        self.assertIn(".*Mono", config)
+
     def test_custom_glossary_is_used(self) -> None:
         glossary = ROOT / "glossary" / "testing-genai-en-zh.csv"
         args = argparse.Namespace(debug=False, pages=None, concurrency=1, glossary=glossary)
@@ -226,6 +242,79 @@ class ValidationTests(unittest.TestCase):
                 output_mode="bilingual",
                 source_size=(504, 661.5),
             )
+
+
+class EventTests(unittest.TestCase):
+    def test_emitter_is_silent_in_text_mode(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            translate_pdf.EventEmitter(False).emit("stage", stage="x")
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_emitter_writes_versioned_json_lines(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            translate_pdf.EventEmitter(True).emit("stage", stage="translating")
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"v": 1, "type": "stage", "stage": "translating"},
+        )
+
+    def test_parse_progress_line(self) -> None:
+        event = translate_pdf.parse_progress_line("\x1b[32mtranslate paragraphs 12/48\x1b[0m")
+        self.assertEqual((event["current"], event["total"]), (12, 48))
+        self.assertAlmostEqual(event["overall"], 0.25)
+        percent = translate_pdf.parse_progress_line("Overall 37.5%")
+        self.assertAlmostEqual(percent["overall"], 0.375)
+        self.assertIsNone(translate_pdf.parse_progress_line("loading fonts"))
+        self.assertIsNone(translate_pdf.parse_progress_line(""))
+
+    def test_errors_carry_codes(self) -> None:
+        with self.assertRaises(translate_pdf.TranslationError) as raised:
+            translate_pdf.validate_input(Path("/nonexistent/input.pdf"))
+        self.assertEqual(raised.exception.code, "input_missing")
+
+    def test_existing_output_has_output_exists_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            input_pdf = touch_pdf(Path(tempdir) / "input.pdf")
+            out = Path(tempdir) / "out"
+            touch_pdf(out / "input.en-zh.side-by-side.pdf")
+            args = argparse.Namespace(
+                input=input_pdf, backend="openai-compatible", pages="1", output_dir=out,
+                model="m", base_url=None, api_key_env="PI_DOCS_TEST_KEY", qps=None,
+                auth_file=None, babeldoc="python3", debug=False, dry_run=False,
+                output_mode="bilingual", events="json",
+            )
+            os_environ = translate_pdf.os.environ
+            os_environ["PI_DOCS_TEST_KEY"] = "x"
+            try:
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaises(translate_pdf.TranslationError) as raised:
+                        translate_pdf.run_translation(args)
+            finally:
+                del os_environ["PI_DOCS_TEST_KEY"]
+        self.assertEqual(raised.exception.code, "output_exists")
+
+    def test_json_dry_run_emits_single_config_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            input_pdf = touch_pdf(Path(tempdir) / "input.pdf")
+            args = argparse.Namespace(
+                input=input_pdf, backend="openai-compatible", pages=None,
+                output_dir=Path(tempdir) / "out", model="m", base_url=None,
+                api_key_env="OPENAI_API_KEY", qps=None, auth_file=None,
+                babeldoc="python3", debug=False, dry_run=True,
+                output_mode="translated-only", events="json",
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                status = translate_pdf.run_translation(args)
+        self.assertEqual(status, 0)
+        lines = stdout.getvalue().strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        event = json.loads(lines[0])
+        self.assertEqual(event["type"], "config")
+        self.assertEqual(event["v"], 1)
+        self.assertTrue(event["config"]["babeldoc_no_dual"])
 
 
 class DryRunTests(unittest.TestCase):

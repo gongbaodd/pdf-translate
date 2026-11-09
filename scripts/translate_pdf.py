@@ -6,11 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -40,7 +43,71 @@ OUTPUT_MODES = ("bilingual", "translated-only")
 
 
 class TranslationError(RuntimeError):
-    """An actionable preflight or translation failure."""
+    """An actionable preflight or translation failure.
+
+    ``code`` is a stable identifier for machine consumers (``--events json``).
+    """
+
+    def __init__(self, message: str, code: str = "error") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+EVENT_PROTOCOL_VERSION = 1
+
+
+class EventEmitter:
+    """Writes the line-delimited JSON event protocol used by the desktop app.
+
+    In text mode every method is a no-op, so existing output is unchanged.
+    Events never carry credentials.
+    """
+
+    def __init__(self, enabled: bool = False) -> None:
+        self.enabled = enabled
+        self._lock = threading.Lock()
+
+    def emit(self, event_type: str, **fields: Any) -> None:
+        if not self.enabled:
+            return
+        line = json.dumps(
+            {"v": EVENT_PROTOCOL_VERSION, "type": event_type, **fields},
+            ensure_ascii=False,
+        )
+        with self._lock:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    def stage(self, stage: str) -> None:
+        self.emit("stage", stage=stage)
+
+    def warning(self, message: str) -> None:
+        print(f"warning: {message}", file=sys.stderr)
+        self.emit("warning", message=message)
+
+
+_PROGRESS_PERCENT = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+_PROGRESS_COUNT = re.compile(r"(\d+)\s*/\s*(\d+)")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def parse_progress_line(line: str) -> dict[str, Any] | None:
+    """Best-effort extraction of progress from a BabelDOC console line."""
+    text = _ANSI.sub("", line).strip()
+    if not text:
+        return None
+    percent = _PROGRESS_PERCENT.search(text)
+    count = _PROGRESS_COUNT.search(text)
+    if percent is None and count is None:
+        return None
+    event: dict[str, Any] = {"stage": text[:120]}
+    if count:
+        event["current"], event["total"] = int(count.group(1)), int(count.group(2))
+    if percent and 0 <= float(percent.group(1)) <= 100:
+        event["overall"] = float(percent.group(1)) / 100
+    elif count and int(count.group(2)) > 0:
+        event["overall"] = min(1.0, int(count.group(1)) / int(count.group(2)))
+    return event
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,6 +137,10 @@ def parse_args() -> argparse.Namespace:
         help="Parallel bridge requests and BabelDOC workers (1-16); useful with --backend claude-code",
     )
     parser.add_argument(
+        "--code-font-pattern",
+        help="Regex of extra font names to keep verbatim (code listings), e.g. 'Courier.*'",
+    )
+    parser.add_argument(
         "--glossary",
         type=Path,
         default=DEFAULT_GLOSSARY,
@@ -84,6 +155,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--debug", action="store_true", help="Preserve BabelDOC tracebacks and debug artifacts")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--events",
+        choices=("text", "json"),
+        default="text",
+        help="json: write line-delimited JSON events to stdout (used by the desktop app)",
+    )
     return parser.parse_args()
 
 def auth_file_for(args: argparse.Namespace) -> Path | None:
@@ -96,7 +173,7 @@ def auth_file_for(args: argparse.Namespace) -> Path | None:
 
 def check_executable(executable: str, label: str) -> None:
     if shutil.which(executable) is None:
-        raise TranslationError(f"{label} executable not found: {executable}")
+        raise TranslationError(f"{label} executable not found: {executable}", "executable_missing")
 
 
 def check_node() -> None:
@@ -106,22 +183,34 @@ def check_node() -> None:
     )
     version = completed.stdout.strip().lstrip("v").split(".")
     if len(version) < 2 or (int(version[0]), int(version[1])) < (22, 19):
-        raise TranslationError(f"Node.js >=22.19 is required, found {completed.stdout.strip()}")
+        raise TranslationError(f"Node.js >=22.19 is required, found {completed.stdout.strip()}", "node_version")
 
 
 def validate_input(path: Path) -> Path:
     path = path.expanduser().resolve()
     if not path.is_file():
-        raise TranslationError(f"input PDF does not exist: {path}")
+        raise TranslationError(f"input PDF does not exist: {path}", "input_missing")
     if path.suffix.lower() != ".pdf":
-        raise TranslationError(f"input must be a PDF: {path}")
+        raise TranslationError(f"input must be a PDF: {path}", "input_invalid")
     if path.stat().st_size == 0:
-        raise TranslationError(f"input PDF is empty: {path}")
+        raise TranslationError(f"input PDF is empty: {path}", "input_invalid")
     return path
 
 
 def toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+# BabelDOC 0.6.4's default "broad" formula-font pattern. Passing
+# formular-font-pattern replaces it, so the default is kept and extended.
+BABELDOC_FORMULA_FONT_PATTERN = (
+    r"CM[^RB]|(MS|XY|MT|BL|RM|EU|LA|RS)[A-Z]|LINE|LCIRCLE|TeX-|rsfs|txsy|wasy|stmary"
+    r"|.*Mono|.*Code|.*Sym|.*Math|AdvP4C4E74|AdvPSSym|AdvP4C4E59"
+)
+
+
+def formula_font_pattern(code_font_pattern: str) -> str:
+    return f"({BABELDOC_FORMULA_FONT_PATTERN}|{code_font_pattern})"
 
 
 def build_config(
@@ -153,6 +242,11 @@ def build_config(
         f"pool-max-workers = {workers}",
         f"term-pool-max-workers = {workers}",
         f"glossary-files = {toml_string(str(glossary))}",
+        *(
+            [f"formular-font-pattern = {toml_string(formula_font_pattern(args.code_font_pattern))}"]
+            if getattr(args, "code_font_pattern", None)
+            else []
+        ),
         "enable-json-mode-if-requested = false",
         "report-interval = 1.0",
     ]
@@ -205,18 +299,21 @@ def validate_output(
     *,
     output_mode: str = "bilingual",
     source_size: tuple[float, float] | None = None,
+    emitter: EventEmitter | None = None,
 ) -> None:
+    emitter = emitter or EventEmitter(False)
     if not path.is_file() or path.stat().st_size == 0:
-        raise TranslationError(f"BabelDOC did not produce a non-empty output PDF: {path}")
+        raise TranslationError(f"BabelDOC did not produce a non-empty output PDF: {path}", "validation_failed")
     try:
         import fitz  # type: ignore[import-not-found]
     except ImportError:
-        print("warning: PyMuPDF unavailable; skipped PDF page and glyph validation", file=sys.stderr)
+        emitter.warning("PyMuPDF unavailable; skipped PDF page and glyph validation")
         return
     with fitz.open(path) as document:
         if expected_pages is not None and document.page_count != expected_pages:
             raise TranslationError(
-                f"expected {expected_pages} output pages, found {document.page_count}"
+                f"expected {expected_pages} output pages, found {document.page_count}",
+                "validation_failed",
             )
         if document.page_count and source_size is not None:
             width, height = document[0].rect.width, document[0].rect.height
@@ -230,7 +327,8 @@ def validate_output(
             ):
                 raise TranslationError(
                     f"unexpected {output_mode} page size: {width:.1f} x {height:.1f} points; "
-                    f"expected {expected_width:.1f} x {expected_height:.1f}"
+                    f"expected {expected_width:.1f} x {expected_height:.1f}",
+                    "validation_failed",
                 )
         if translation_pages:
             sample_indexes = [
@@ -241,22 +339,22 @@ def validate_output(
         for index in sorted(set(sample_indexes)):
             text = document[index].get_text()
             if not any("\u3400" <= character <= "\u9fff" for character in text):
-                print(f"warning: no Chinese glyph extracted from output page {index + 1}", file=sys.stderr)
+                emitter.warning(f"no Chinese glyph extracted from output page {index + 1}")
 
 
 def wait_for_bridge(process: subprocess.Popen[str]) -> dict[str, Any]:
     if process.stdout is None:
-        raise TranslationError("bridge stdout was not captured")
+        raise TranslationError("bridge stdout was not captured", "bridge_failed")
     line = process.stdout.readline()
     if not line:
         detail = process.poll()
-        raise TranslationError(f"provider bridge exited before readiness (status={detail})")
+        raise TranslationError(f"provider bridge exited before readiness (status={detail})", "bridge_failed")
     try:
         message = json.loads(line)
     except json.JSONDecodeError as error:
-        raise TranslationError(f"provider bridge emitted invalid readiness JSON: {line!r}") from error
+        raise TranslationError(f"provider bridge emitted invalid readiness JSON: {line!r}", "bridge_failed") from error
     if not message.get("ready") or not isinstance(message.get("port"), int):
-        raise TranslationError(f"provider bridge did not become ready: {message!r}")
+        raise TranslationError(f"provider bridge did not become ready: {message!r}", "bridge_failed")
     return message
 
 
@@ -265,9 +363,9 @@ def check_bridge_health(port: int) -> None:
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             if response.status != 200:
-                raise TranslationError(f"provider bridge health check returned HTTP {response.status}")
+                raise TranslationError(f"provider bridge health check returned HTTP {response.status}", "bridge_failed")
     except urllib.error.URLError as error:
-        raise TranslationError(f"provider bridge health check failed: {error}") from error
+        raise TranslationError(f"provider bridge health check failed: {error}", "bridge_failed") from error
 
 
 def terminate(process: subprocess.Popen[str] | None) -> None:
@@ -297,7 +395,7 @@ def find_output(
         and not path.name.endswith(".decompressed.pdf")
     ]
     if not candidates:
-        raise TranslationError(f"no new PDF found under {output_dir}")
+        raise TranslationError(f"no new PDF found under {output_dir}", "output_not_found")
     keywords = ("mono",) if output_mode == "translated-only" else ("dual", "bilingual")
     preferred = [
         path
@@ -313,40 +411,78 @@ def find_output(
         return candidates[0]
     names = ", ".join(str(path) for path in candidates)
     raise TranslationError(
-        f"could not identify the {output_mode} BabelDOC output among: {names}"
+        f"could not identify the {output_mode} BabelDOC output among: {names}",
+        "output_not_found",
     )
 
 
-def run_translation(args: argparse.Namespace) -> int:
+def run_babeldoc(command: list[str], emitter: EventEmitter) -> int:
+    """Run BabelDOC. In json mode its output goes to stderr and progress becomes events."""
+    if not emitter.enabled:
+        return subprocess.run(command, cwd=ROOT).returncode
+    process = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        bufsize=1,
+    )
+    last = -1.0
+    try:
+        assert process.stdout is not None
+        # BabelDOC redraws progress with carriage returns, so split on both.
+        for chunk in process.stdout:
+            for line in re.split(r"[\r\n]+", chunk):
+                if not line:
+                    continue
+                print(line, file=sys.stderr, flush=True)
+                progress = parse_progress_line(line)
+                if progress is None:
+                    continue
+                overall = progress.get("overall", -1.0)
+                if overall == last:
+                    continue
+                last = overall
+                emitter.emit("progress", **progress)
+        return process.wait()
+    finally:
+        terminate(process)
+
+
+def run_translation(args: argparse.Namespace, emitter: EventEmitter | None = None) -> int:
+    if emitter is None:
+        emitter = EventEmitter(getattr(args, "events", "text") == "json")
     input_path = validate_input(args.input)
     check_executable(args.babeldoc, "BabelDOC")
     glossary_path = Path(getattr(args, "glossary", None) or DEFAULT_GLOSSARY).expanduser().resolve()
     if not glossary_path.is_file():
-        raise TranslationError(f"glossary does not exist: {glossary_path}")
+        raise TranslationError(f"glossary does not exist: {glossary_path}", "glossary_missing")
     concurrency = getattr(args, "concurrency", 1) or 1
     if not 1 <= concurrency <= 16:
-        raise TranslationError("--concurrency must be between 1 and 16")
+        raise TranslationError("--concurrency must be between 1 and 16", "invalid_option")
     args.output_dir = args.output_dir.expanduser().resolve()
     final_path = final_output_path(input_path, args.output_dir, args.output_mode)
     bridge_backend = args.backend in BRIDGE_BACKENDS
     qps = args.qps if args.qps is not None else (concurrency if bridge_backend else max(2, concurrency))
     if qps < 1:
-        raise TranslationError("--qps must be at least 1")
+        raise TranslationError("--qps must be at least 1", "invalid_option")
     if bridge_backend and args.base_url:
-        raise TranslationError("--base-url is only valid with --backend openai-compatible")
+        raise TranslationError("--base-url is only valid with --backend openai-compatible", "invalid_option")
     base_url = args.base_url or "https://api.openai.com/v1"
     key_env = args.api_key_env
     api_key = os.environ.get(key_env, "")
     if args.backend == "openai-compatible" and not args.dry_run and not api_key:
-        raise TranslationError(f"missing API key in environment variable {key_env}")
+        raise TranslationError(f"missing API key in environment variable {key_env}", "missing_api_key")
     auth_file = auth_file_for(args)
     claude_bin = getattr(args, "claude_bin", None) or "claude"
     if args.backend == "claude-code" and args.auth_file:
-        raise TranslationError("--auth-file is not used with --backend claude-code; sign in with `claude` instead")
+        raise TranslationError("--auth-file is not used with --backend claude-code; sign in with `claude` instead", "invalid_option")
     if bridge_backend:
         check_node()
         if not BRIDGE_SCRIPT.is_file():
-            raise TranslationError(f"provider bridge does not exist: {BRIDGE_SCRIPT}")
+            raise TranslationError(f"provider bridge does not exist: {BRIDGE_SCRIPT}", "bridge_failed")
         if args.backend == "claude-code":
             check_executable(claude_bin, "Claude Code CLI")
         model_for_babeldoc = f"{ALIAS_PREFIXES[args.backend]}{args.model}"
@@ -374,6 +510,7 @@ def run_translation(args: argparse.Namespace) -> int:
         "qps": qps,
         "concurrency": concurrency,
         "glossary": str(glossary_path),
+        "code_font_pattern": getattr(args, "code_font_pattern", None),
         "output_mode": args.output_mode,
         "babeldoc_no_mono": args.output_mode == "bilingual",
         "babeldoc_no_dual": args.output_mode == "translated-only",
@@ -384,11 +521,15 @@ def run_translation(args: argparse.Namespace) -> int:
         "command": command_preview,
     }
     if args.dry_run:
-        print(json.dumps(configuration, indent=2, ensure_ascii=False))
+        if emitter.enabled:
+            emitter.emit("config", config=configuration)
+        else:
+            print(json.dumps(configuration, indent=2, ensure_ascii=False))
         return 0
+    emitter.emit("config", config=configuration)
 
     if final_path.exists():
-        raise TranslationError(f"refusing to overwrite existing output: {final_path}")
+        raise TranslationError(f"refusing to overwrite existing output: {final_path}", "output_exists")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     before = set(args.output_dir.rglob("*.pdf"))
     bridge: subprocess.Popen[str] | None = None
@@ -397,6 +538,7 @@ def run_translation(args: argparse.Namespace) -> int:
     config_path = Path(temporary_directory.name) / "babeldoc.toml"
     try:
         if bridge_backend:
+            emitter.stage("bridge_starting")
             environment = os.environ.copy()
             environment["BABELDOC_BRIDGE_TOKEN"] = token
             bridge = subprocess.Popen(
@@ -427,6 +569,7 @@ def run_translation(args: argparse.Namespace) -> int:
             ready = wait_for_bridge(bridge)
             port = ready["port"]
             check_bridge_health(port)
+            emitter.stage("bridge_ready")
             base_url = f"http://127.0.0.1:{port}/v1"
             api_key = token
         config_path.write_text(
@@ -445,10 +588,12 @@ def run_translation(args: argparse.Namespace) -> int:
         command = [args.babeldoc, "--config", str(config_path), "--files", str(input_path)]
         if args.pages:
             command.extend(["--pages", args.pages])
-        print("Running:", " ".join(command), flush=True)
-        completed = subprocess.run([args.babeldoc, "--config", str(config_path), "--files", str(input_path), *(["--pages", args.pages] if args.pages else [])], cwd=ROOT)
-        if completed.returncode != 0:
-            raise TranslationError(f"BabelDOC failed with exit status {completed.returncode}")
+        print("Running:", " ".join(command), file=sys.stderr if emitter.enabled else sys.stdout, flush=True)
+        emitter.stage("translating")
+        returncode = run_babeldoc(command, emitter)
+        if returncode != 0:
+            raise TranslationError(f"BabelDOC failed with exit status {returncode}", "babeldoc_failed")
+        emitter.stage("validating")
         source_output = find_output(
             args.output_dir, before, final_path, args.output_mode
         )
@@ -461,24 +606,42 @@ def run_translation(args: argparse.Namespace) -> int:
             explicit_pages,
             output_mode=args.output_mode,
             source_size=source_size,
+            emitter=emitter,
         )
         if source_output.resolve() != final_path.resolve():
             if final_path.exists():
-                raise TranslationError(f"refusing to overwrite existing output: {final_path}")
+                raise TranslationError(f"refusing to overwrite existing output: {final_path}", "output_exists")
             source_output.rename(final_path)
-        print(f"Wrote {final_path}")
+        if emitter.enabled:
+            emitter.emit("result", output_file=str(final_path), pages=expected_pages)
+        else:
+            print(f"Wrote {final_path}")
         return 0
     finally:
         terminate(bridge)
         temporary_directory.cleanup()
 
 
+def _raise_interrupt(signum: int, _frame: Any) -> None:
+    # Let `finally` blocks stop the bridge and delete the temporary config.
+    raise KeyboardInterrupt
+
+
 def main() -> int:
+    args = parse_args()
+    emitter = EventEmitter(args.events == "json")
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _raise_interrupt)
     try:
-        return run_translation(parse_args())
+        return run_translation(args, emitter)
     except (TranslationError, OSError, ValueError) as error:
         print(f"translate_pdf: {error}", file=sys.stderr)
+        emitter.emit("error", code=getattr(error, "code", "error"), message=str(error))
         return 2
+    except KeyboardInterrupt:
+        emitter.emit("error", code="cancelled", message="cancelled")
+        return 130
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@ The root project translates English PDFs into English/Simplified-Chinese side-by
 - A Claude Pro/Max subscription through the local Claude Code CLI (`claude-code`)
 - Direct OpenAI-compatible endpoints through BabelDOC
 
+`desktop/` is a native GPUI desktop app that wraps the same pipeline (see [Desktop app](#desktop-app)).
+
 `pi-cast/` is a separate Apple Silicon podcast/video pipeline.
 
 ## Repository map
@@ -17,6 +19,7 @@ The root project translates English PDFs into English/Simplified-Chinese side-by
 scripts/translation_bridge.ts   Local OpenAI Chat Completions adapter
 scripts/translate_pdf.py        BabelDOC runner and backend selection
 test/translation_bridge.test.ts Bridge unit tests
+desktop/                        GPUI desktop app (Rust)
 docs/translation.md             Installation and operational instructions
 docs/plan/                      Design notes and implementation plan
 package.json                    Node commands and pinned pi-ai dependency
@@ -154,10 +157,32 @@ source page size. The default remains `--output-mode bilingual`.
 
 Detailed options and operational notes are in [`docs/translation.md`](docs/translation.md).
 
+## Desktop app
+
+`desktop/` is a [GPUI](https://www.gpui.rs/) app. It runs the scripts above as
+child processes and reads their `--events json` output, so the CLI stays the
+source of truth.
+
+```bash
+npm ci && uv sync          # once, as above
+cd desktop
+cargo run --release
+```
+
+The app finds the repository by walking up from the working directory, or from
+`PI_DOCS_ROOT`. Start it from a shell if you use OpenAI-compatible mode, because
+the API key is read from the environment variable you name. Design and status:
+[`docs/plan/gpui-desktop-app.md`](docs/plan/gpui-desktop-app.md).
+
+```bash
+cd desktop && cargo test
+```
+
 ## Agent guidance
 
 - Preserve the provider/auth/model separation in `translation_bridge.ts`.
 - Keep credentials outside the repository; never log API keys or OAuth tokens.
 - Keep the bridge loopback-only and preserve its bearer-token boundary.
 - Update `docs/translation.md` and this README when changing login or backend behavior.
+- Keep the `--events json` protocol (`docs/translation.md`) and `desktop/src/protocol.rs` in sync.
 - Run `npm run test:adapter`, Python syntax checks, and a backend-specific `--dry-run` after changes.
